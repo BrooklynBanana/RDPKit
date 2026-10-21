@@ -974,6 +974,8 @@ public enum RDPPreflightError: Error, CustomStringConvertible {
     case receive(String)
     case tls(String)
     case protocolViolation(String)
+    /// Early User Authorization (HYBRID_EX): Server hat den Benutzer nach NLA abgewiesen (ACCESS_DENIED).
+    case earlyUserAuthorizationDenied
     case cancelled
 
     public var description: String {
@@ -990,6 +992,8 @@ public enum RDPPreflightError: Error, CustomStringConvertible {
             "TLS failed: \(message)"
         case let .protocolViolation(message):
             message
+        case .earlyUserAuthorizationDenied:
+            "early user authorization denied access"
         case .cancelled:
             "cancelled"
         }
@@ -2810,7 +2814,7 @@ private func performTLSHandshake(
         )
         : nil
     if earlyUserAuthorizationResult?.result == .accessDenied {
-        throw RDPPreflightError.protocolViolation("early user authorization denied access")
+        throw RDPPreflightError.earlyUserAuthorizationDenied
     }
     let mcsConnectionSequence = try mcsConfiguration.map { configuration in
         try performMCSConnectionSequence(
