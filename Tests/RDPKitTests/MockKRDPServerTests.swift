@@ -1739,6 +1739,25 @@ struct MockKRDPServerTests {
     #expect(report.selectedProtocols == ["credssp-early-user-auth"])
     #expect(report.earlyUserAuthorizationResult == nil)
     #expect(report.error == "early user authorization denied access")
+
+    // Fork (Connection Manager): mit `throwsSecurityErrors` kommt derselbe Fall als typisierter Fehler.
+    // Hier nacheinander statt als eigener Test – zwei parallel laufende EUAR-Mocks stören sich.
+    let typedServer = try MockKRDPServer.start(securityProtocol: .credSSPWithEarlyUserAuth(
+        credentials: credentials,
+        authorizationResult: .accessDenied
+    ))
+    defer { typedServer.stop() }
+    var configuration = RDPConnectionConfiguration(
+        host: "127.0.0.1", port: typedServer.port, credentials: credentials, timeoutSeconds: 5,
+        hideCertificateWarnings: true, graphicsFrameCaptureLimit: 1, clipboardEnabled: false,
+        earlyUserAuthorizationEnabled: true)
+    configuration.throwsSecurityErrors = true
+    do {
+        _ = try RDPPreflightClient().connect(configuration: configuration)
+        Issue.record("Fehler erwartet")
+    } catch RDPPreflightError.earlyUserAuthorizationDenied {
+        // erwartet
+    }
 }
 
 @Test func livePreflightTimesOutWhenGraphicsPipelineStallsBeforeFirstFrame() throws {

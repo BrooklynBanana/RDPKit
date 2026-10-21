@@ -134,6 +134,9 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
     var redirectionDepth: Int
     /// CredSSP von Anfang an mit v3 ohne Nonce (Legacy-Binding) – gesetzt beim Wiederholungsversuch für 2008 R2.
     var credSSPLegacyMode: Bool = false
+    /// Fehler aus TLS/CredSSP/Early User Authorization als typisierte Fehler werfen (z. B. `RDPCredSSPError.serverError`
+    /// mit NTSTATUS) statt sie nur als Text im Bericht zu liefern. Standard aus (bisheriges Verhalten).
+    public var throwsSecurityErrors: Bool = false
 
     public init(
         host: String,
@@ -1363,6 +1366,7 @@ public struct RDPPreflightClient: Sendable {
                     shouldCancel: shouldCancel
                 )
             } catch {
+                if configuration.throwsSecurityErrors { throw error }
                 return RDPPreflightReport(
                     status: "failure",
                     stage: "tls-upgrade",
