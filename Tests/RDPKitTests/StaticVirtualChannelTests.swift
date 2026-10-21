@@ -148,15 +148,14 @@ import Testing
     }
 }
 
-@Test func staticVirtualChannelRejectsChunkedPDUWithoutShowProtocol() {
+@Test func staticVirtualChannelAcceptsChunkedPDUWithoutShowProtocol() throws {
     var userData = Data()
     userData.appendLittleEndianUInt32(8)
     userData.appendLittleEndianUInt32(RDPStaticVirtualChannelFlags.first)
     userData.append(contentsOf: [0x50, 0x00, 0x02, 0x00])
 
-    #expect(throws: RDPDecodeError.invalidStaticVirtualChannelPDU) {
-        try RDPStaticVirtualChannelPDU.parse(fromUserData: userData)
-    }
+    let pdu = try RDPStaticVirtualChannelPDU.parse(fromUserData: userData)
+    #expect(pdu.totalLength == 8 && !pdu.canDispatchPayload)
 }
 
 @Test func staticVirtualChannelParsesStandaloneNoFlagPDU() throws {
@@ -171,14 +170,23 @@ import Testing
     #expect(pdu.payload == Data([0x50, 0x00, 0x02, 0x00]))
 }
 
-@Test func staticVirtualChannelRejectsNoFlagPartialPDUWithoutShowProtocol() {
-    #expect(throws: RDPDecodeError.invalidStaticVirtualChannelPDU) {
-        try RDPStaticVirtualChannelPDU.parse(fromUserData: staticChannelUserData(
-            totalLength: 8,
-            flags: 0,
-            payload: Data([0x50, 0x00, 0x02, 0x00])
-        ))
+@Test func staticVirtualChannelReassemblesWindowsChunksWithoutShowProtocol() throws {
+    // Windows: first chunk 0x1, middle chunks without flags, last chunk 0x2 (no CHANNEL_FLAG_SHOW_PROTOCOL)
+    var reassembler = RDPStaticVirtualChannelReassembler()
+    let parts: [(UInt32, [UInt8])] = [(RDPStaticVirtualChannelFlags.first, [1, 2]), (0, [3, 4]),
+                                      (RDPStaticVirtualChannelFlags.last, [5])]
+    var complete: RDPStaticVirtualChannelPDU?
+    for (flags, bytes) in parts {
+        let pdu = try RDPStaticVirtualChannelPDU.parse(fromUserData: staticChannelUserData(
+            totalLength: 5, flags: flags, payload: Data(bytes)))
+        complete = try reassembler.append(pdu)
     }
+    #expect(complete?.payload == Data([1, 2, 3, 4, 5]))
+    // a middle chunk without a first chunk is rejected
+    var orphan = RDPStaticVirtualChannelReassembler()
+    let middle = try RDPStaticVirtualChannelPDU.parse(fromUserData: staticChannelUserData(
+        totalLength: 8, flags: 0, payload: Data([0x50, 0x00, 0x02, 0x00])))
+    #expect(throws: RDPDecodeError.invalidStaticVirtualChannelPDU) { try orphan.append(middle) }
 }
 
 @Test func staticVirtualChannelParsesEmptySuspendAndResumePDUs() throws {

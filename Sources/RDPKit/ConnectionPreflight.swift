@@ -5494,14 +5494,12 @@ private func handleClipboardPacket(
     ) else {
         return false
     }
-    guard staticPDU.canDispatchPayload else {
-        if staticPDU.isFlowControl {
-            return true
-        }
-        throw RDPDecodeError.invalidStaticVirtualChannelPDU
+    // Larger clipboard messages (long text, file ranges) arrive in several channel chunks.
+    guard let completePDU = try session.reassemble(staticPDU) else {
+        return true
     }
 
-    let clipboardPDU = try RDPClipboardPDU.parse(from: staticPDU.payload)
+    let clipboardPDU = try RDPClipboardPDU.parse(from: completePDU.payload)
     messageData.append(packet)
     messages.append(.summarize(clipboardPDU))
 

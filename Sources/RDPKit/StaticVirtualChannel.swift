@@ -158,15 +158,10 @@ struct RDPStaticVirtualChannelPDU: Equatable, Sendable {
             guard totalLength == 0, payload.isEmpty else {
                 throw RDPDecodeError.invalidStaticVirtualChannelPDU
             }
-        } else if !hasFirst && !hasLast && !hasShowProtocol {
-            guard totalLength == UInt32(payload.count) else {
-                throw RDPDecodeError.invalidStaticVirtualChannelPDU
-            }
-        } else {
-            guard hasShowProtocol else {
-                throw RDPDecodeError.invalidStaticVirtualChannelPDU
-            }
         }
+        // Chunks of a larger message: CHANNEL_FLAG_SHOW_PROTOCOL is only present when the channel was opened with
+        // CHANNEL_OPTION_SHOW_PROTOCOL – Windows sends clipboard chunks without it (first 0x1, middle 0x0, last 0x2).
+        _ = hasShowProtocol
 
         return RDPStaticVirtualChannelPDU(
             totalLength: totalLength,
@@ -222,23 +217,16 @@ struct RDPStaticVirtualChannelReassembler: Sendable {
         if pdu.isFlowControl {
             return nil
         }
-        if pdu.isComplete {
-            guard totalLength == nil else {
-                throw RDPDecodeError.invalidStaticVirtualChannelPDU
-            }
-            return pdu
-        }
-        if pdu.isStandalone {
-            guard totalLength == nil else {
-                throw RDPDecodeError.invalidStaticVirtualChannelPDU
-            }
-            return pdu
-        }
-
         let hasFirst = pdu.flags & RDPStaticVirtualChannelFlags.first != 0
         let hasLast = pdu.flags & RDPStaticVirtualChannelFlags.last != 0
-        guard pdu.flags & RDPStaticVirtualChannelFlags.showProtocol != 0 else {
-            throw RDPDecodeError.invalidStaticVirtualChannelPDU
+        // While a message is being collected, chunks without CHANNEL_FLAG_FIRST continue it (middle chunks carry no
+        // flags at all); otherwise a chunk without FIRST/LAST that holds the whole message stands alone.
+        let continuesMessage = totalLength != nil && !hasFirst
+        if !continuesMessage, pdu.isComplete || pdu.isStandalone {
+            guard totalLength == nil else {
+                throw RDPDecodeError.invalidStaticVirtualChannelPDU
+            }
+            return pdu
         }
 
         if hasFirst {

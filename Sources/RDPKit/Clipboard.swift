@@ -1101,6 +1101,7 @@ public final class RDPClipboardSession: @unchecked Sendable {
     private var localContent = RDPClipboardLocalContent.empty
     private var pendingFormatDataResponse: RDPClipboardRequestedFormatDataResponse?
     private var serverGeneralFlags: UInt32 = 0
+    private var reassembler = RDPStaticVirtualChannelReassembler()
 
     init(
         userChannelID: UInt16,
@@ -1150,6 +1151,13 @@ public final class RDPClipboardSession: @unchecked Sendable {
                 formatName: RDPClipboardRegisteredFormatName.fileContents
             ),
         ]).encoded(useLongFormatNames: usesLongFormatNames))
+    }
+
+    /// Collects channel chunks; returns the complete message once its last chunk arrived.
+    func reassemble(_ pdu: RDPStaticVirtualChannelPDU) throws -> RDPStaticVirtualChannelPDU? {
+        lock.lock()
+        defer { lock.unlock() }
+        return try reassembler.append(pdu)
     }
 
     func updateServerCapabilities(_ capabilities: RDPClipboardCapabilitiesPDU) {
@@ -1265,17 +1273,17 @@ public final class RDPClipboardSession: @unchecked Sendable {
             return
         }
 
+        // Windows requests fixed-size ranges; at the end of a file it gets the remaining bytes (MS-RDPECLIP 2.2.5.4).
         guard request.flags & RDPClipboardFileContentsFlags.range != 0,
               request.position <= UInt64(file.contents.count),
-              UInt64(request.requestedByteCount) <= UInt64(file.contents.count) - request.position,
-              let lowerBound = Int(exactly: request.position),
-              let requestedByteCount = Int(exactly: request.requestedByteCount)
+              let lowerBound = Int(exactly: request.position)
         else {
             send(RDPClipboardFileContentsResponsePDU.failure(streamID: request.streamID).encoded())
             return
         }
 
-        let upperBound = lowerBound + requestedByteCount
+        let upperBound = lowerBound + Int(min(UInt64(request.requestedByteCount),
+                                              UInt64(file.contents.count) - request.position))
         send(RDPClipboardFileContentsResponsePDU.range(
             streamID: request.streamID,
             data: file.contents.subdata(in: lowerBound ..< upperBound)
@@ -1429,3 +1437,4 @@ private func decodeClipboardUnicodeFormatName(_ codeUnits: [UInt16]) -> String? 
     }
     return String(decoding: codeUnits, as: UTF16.self)
 }
+
