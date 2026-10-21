@@ -422,7 +422,8 @@ enum RDPSPNEGO {
     }
 }
 
-enum RDPCredSSPError: Error, CustomStringConvertible {
+/// Fehler der NLA-Anmeldung (CredSSP). `serverError` trägt den NTSTATUS-Code, den der Server im TSRequest meldet.
+public enum RDPCredSSPError: Error, CustomStringConvertible {
     case missingCredentials
     case unsupportedVersion(Int)
     case missingToken
@@ -432,7 +433,7 @@ enum RDPCredSSPError: Error, CustomStringConvertible {
     case serverBindingMismatch
     case legacyServerRejectedModernBinding
 
-    var description: String {
+    public var description: String {
         switch self {
         case .legacyServerRejectedModernBinding:
             "server closed the connection after the CredSSP v5 public key binding; retrying with legacy CredSSP"
