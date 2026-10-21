@@ -19,7 +19,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.80.0"),
-        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.37.1"),
+        // Fork mit enforceRSAKeyUsage (Windows-RDP-Zertifikate ohne digitalSignature)
+        .package(url: "https://github.com/BrooklynBanana/swift-nio-ssl.git", exact: "2.37.5-cm.1"),
     ],
     targets: [
         .target(

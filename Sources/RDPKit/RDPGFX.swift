@@ -1608,25 +1608,13 @@ struct RDPGFXStartFramePDU: Equatable, Sendable {
         }
 
         var cursor = ByteCursor(message.payload)
+        // Der Zeitstempel ist rein informativ. Windows Server 2022 sendet Werte außerhalb des
+        // MS-RDPEGFX-Formats (z. B. Minuten 63, Stunden 991); FreeRDP und mstsc ignorieren ihn ebenfalls.
         let timestamp = try cursor.readLittleEndianUInt32()
-        guard isValidTimestamp(timestamp) else {
-            throw RDPDecodeError.invalidRDPGFXPDU
-        }
         return try RDPGFXStartFramePDU(
             timestamp: timestamp,
             frameID: cursor.readLittleEndianUInt32()
         )
-    }
-
-    private static func isValidTimestamp(_ timestamp: UInt32) -> Bool {
-        let milliseconds = timestamp & 0x03FF
-        let seconds = (timestamp >> 10) & 0x003F
-        let minutes = (timestamp >> 16) & 0x003F
-        let hours = (timestamp >> 22) & 0x03FF
-        return milliseconds <= 999
-            && seconds <= 59
-            && minutes <= 59
-            && hours <= 23
     }
 }
 

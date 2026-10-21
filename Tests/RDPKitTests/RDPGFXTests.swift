@@ -411,25 +411,27 @@ import Testing
     #expect(startFrame.frameID == 42)
 }
 
-@Test func rejectsStartFrameTimestampOutsideSpecLimits() {
-    let invalidTimestamps = [
+@Test func acceptsStartFrameTimestampOutsideSpecLimits() throws {
+    // Windows Server 2022 sendet z. B. 0xF7FF7C00 (Minuten 63, Stunden 991); der Zeitstempel ist rein informativ.
+    let timestamps: [UInt32] = [
+        0xF7FF_7C00,
         startFrameTimestamp(milliseconds: 1000, seconds: 0, minutes: 0, hours: 0),
         startFrameTimestamp(milliseconds: 0, seconds: 60, minutes: 0, hours: 0),
         startFrameTimestamp(milliseconds: 0, seconds: 0, minutes: 60, hours: 0),
         startFrameTimestamp(milliseconds: 0, seconds: 0, minutes: 0, hours: 24),
     ]
 
-    for timestamp in invalidTimestamps {
+    for timestamp in timestamps {
         var payload = Data()
         payload.appendLittleEndianUInt32(timestamp)
-        payload.appendLittleEndianUInt32(42)
+        payload.appendLittleEndianUInt32(3)
 
-        #expect(throws: RDPDecodeError.invalidRDPGFXPDU) {
-            try RDPGFXStartFramePDU.parse(from: RDPGFXHeader.parse(from: graphicsMessage(
-                commandID: RDPGFXCommandID.startFrame,
-                payload: payload
-            )))
-        }
+        let startFrame = try RDPGFXStartFramePDU.parse(from: RDPGFXHeader.parse(from: graphicsMessage(
+            commandID: RDPGFXCommandID.startFrame,
+            payload: payload
+        )))
+        #expect(startFrame.timestamp == timestamp)
+        #expect(startFrame.frameID == 3)
     }
 }
 

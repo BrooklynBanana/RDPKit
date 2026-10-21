@@ -132,6 +132,8 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
     var redirectionRoutingToken: Data?
     var redirectionSessionID: UInt32?
     var redirectionDepth: Int
+    /// CredSSP von Anfang an mit v3 ohne Nonce (Legacy-Binding) – gesetzt beim Wiederholungsversuch für 2008 R2.
+    var credSSPLegacyMode: Bool = false
 
     public init(
         host: String,
@@ -1170,6 +1172,7 @@ public struct RDPPreflightClient: Sendable {
                     hideCertificateWarnings: configuration.hideCertificateWarnings,
                     credentials: configuration.credentials,
                     credSSPRequired: usesCredSSP,
+                    credSSPLegacyMode: configuration.credSSPLegacyMode,
                     earlyUserAuthorizationRequired: selectedSecurityProtocols == .credSSPWithEarlyUserAuth,
                     mcsConfiguration: mcsConfiguration,
                     graphicsFrameCaptureLimit: configuration.graphicsFrameCaptureLimit,
@@ -1334,6 +1337,27 @@ public struct RDPPreflightClient: Sendable {
                     nextStage: mcsSequenceSucceeded ? mcsSequence.nextStage : nil,
                     error: mcsSequenceSucceeded ? nil : mcsSequence.failureMessage
                 )
+            } catch RDPCredSSPError.legacyServerRejectedModernBinding where !configuration.credSSPLegacyMode {
+                // Neuer Verbindungsaufbau mit CredSSP v3 von der ersten Nachricht an.
+                var legacyConfiguration = configuration
+                legacyConfiguration.credSSPLegacyMode = true
+                return try connect(
+                    configuration: legacyConfiguration,
+                    onGraphicsFrame: onGraphicsFrame,
+                    onRemotePointer: onRemotePointer,
+                    onInputReady: onInputReady,
+                    onDisplayControlReady: onDisplayControlReady,
+                    onClipboardReady: onClipboardReady,
+                    onClipboardText: onClipboardText,
+                    onClipboardFileGroupDescriptor: onClipboardFileGroupDescriptor,
+                    onClipboardFileContents: onClipboardFileContents,
+                    onAudioSample: onAudioSample,
+                    onCertificate: onCertificate,
+                    onWireReceive: onWireReceive,
+                    wireTranscript: wireTranscript,
+                    cancellation: cancellation,
+                    shouldCancel: shouldCancel
+                )
             } catch {
                 return RDPPreflightReport(
                     status: "failure",
@@ -1494,6 +1518,8 @@ private struct MCSConnectionSequence {
     var graphicsResponseData: Data? = nil
     var graphicsResponse: RDPGFXHeader? = nil
     var graphicsCapsConfirm: RDPGFXCapsConfirmPDU? = nil
+    /// Server ohne RDPGFX (z. B. 2008 R2): Frames kommen als klassische Bitmap-Updates.
+    var graphicsLegacyBitmapMode: Bool = false
     var graphicsUpdateResponseCount: Int = 0
     var graphicsUpdateResponseData: [Data] = []
     var graphicsUpdateMessages: [RDPGFXMessageSummary] = []
@@ -1560,6 +1586,9 @@ private struct MCSConnectionSequence {
             guard connectionFinalized else {
                 return false
             }
+        }
+        if graphicsLegacyBitmapMode {
+            return !graphicsFrames.isEmpty && graphicsError == nil
         }
         if graphicsAttempted {
             guard graphicsCapsConfirm != nil else {
@@ -1788,7 +1817,14 @@ private struct MCSConnectionSequence {
         } else if let finalizationError {
             return finalizationError
         }
-        if graphicsAttempted {
+        if graphicsLegacyBitmapMode {
+            if let graphicsError {
+                return graphicsError
+            }
+            if graphicsFrames.isEmpty {
+                return "server sent no bitmap updates"
+            }
+        } else if graphicsAttempted {
             if let graphicsRemoteTermination, graphicsCapsConfirm == nil {
                 return graphicsError ?? "\(graphicsRemoteTermination.description) before opening RDPGFX dynamic channel"
             }
@@ -1867,6 +1903,7 @@ private struct RDPConnectionFinalizationResult {
 }
 
 private struct RDPGraphicsDynamicChannelResult {
+    var legacyBitmapMode = false
     var dynamicChannelRequestData: [Data] = []
     var dynamicChannelRequestTypes: [String] = []
     var dynamicChannelCapabilitiesRequest: RDPDynamicVirtualChannelCapabilitiesRequest? = nil
@@ -2647,6 +2684,7 @@ private func performTLSHandshake(
     hideCertificateWarnings: Bool,
     credentials: RDPCredentials? = nil,
     credSSPRequired: Bool,
+    credSSPLegacyMode: Bool = false,
     earlyUserAuthorizationRequired: Bool,
     mcsConfiguration: MCSConnectInitialConfiguration? = nil,
     graphicsFrameCaptureLimit: Int?,
@@ -2702,6 +2740,9 @@ private func performTLSHandshake(
     // Windows RDP can issue RSA certificates without digitalSignature,
     // which BoringSSL rejects on the TLS 1.3 certificate path.
     tlsConfiguration.maximumTLSVersion = .tlsv12
+    // BoringSSL also enforces keyUsage for ECDHE-RSA in TLS 1.2 (KEY_USAGE_BIT_INCORRECT).
+    // FreeRDP/OpenSSL and the Windows client accept such certificates; trust is decided by fingerprint.
+    tlsConfiguration.enforceRSAKeyUsage = false
 
     let tlsContext = try NIOSSLContext(configuration: tlsConfiguration)
     let handshakePromise = channel.eventLoop.makePromise(of: Void.self)
@@ -2752,6 +2793,7 @@ private func performTLSHandshake(
             workstationName: mcsConfiguration?.clientName ?? "KRDPSWIFT",
             certificates: peerCertificates,
             timeoutSeconds: timeoutSeconds,
+            legacyMode: credSSPLegacyMode,
             onWireReceive: onWireReceive,
             cancellation: cancellation,
             shouldCancel: shouldCancel
@@ -2848,6 +2890,7 @@ private func performCredSSPHandshake(
     workstationName: String,
     certificates: [NIOSSLCertificate],
     timeoutSeconds: Int,
+    legacyMode: Bool = false,
     onWireReceive: RDPWireReceiveHandler?,
     cancellation: RDPConnectionCancellation?,
     shouldCancel: RDPCancellationHandler?
@@ -2860,9 +2903,22 @@ private func performCredSSPHandshake(
     let subjectPublicKey = try RDPCredSSPCertificate.subjectPublicKey(
         fromCertificateDER: Data(leafCertificate.toDERBytes())
     )
-    let channelBindingsHash = try RDPCredSSPCertificate.ntlmChannelBindingsHash(
+    var channelBindingsHash: Data? = try RDPCredSSPCertificate.ntlmChannelBindingsHash(
         fromCertificateDER: Data(leafCertificate.toDERBytes())
     )
+    // Spike-Diagnose: Channel Binding weglassen oder mit SHA-1 statt SHA-256 berechnen.
+    switch ProcessInfo.processInfo.environment["RDPKIT_NTLM_CBT"] {
+    case "none":
+        channelBindingsHash = nil
+    case "sha1":
+        let token = Data("tls-server-end-point:".utf8) + Data(Insecure.SHA1.hash(data: Data(try leafCertificate.toDERBytes())))
+        var bindings = Data(repeating: 0, count: 16)
+        bindings.append(contentsOf: withUnsafeBytes(of: UInt32(token.count).littleEndian, Array.init))
+        bindings.append(token)
+        channelBindingsHash = Data(Insecure.MD5.hash(data: bindings))
+    default:
+        break
+    }
     let ntlmContext = RDPCredSSPNTLMContext(
         credentials: credentials,
         workstationName: "",
@@ -2874,7 +2930,11 @@ private func performCredSSPHandshake(
         try? channel.pipeline.removeHandler(reader).wait()
     }
 
-    var negotiatedVersion = 6
+    // Spike-Diagnose: Start-Version überschreibbar (alte Server, z. B. 2008 R2).
+    var negotiatedVersion = legacyMode
+        ? 3
+        : ProcessInfo.processInfo.environment["RDPKIT_CREDSSP_VERSION"].flatMap(Int.init) ?? 6
+    var serverReportedVersion: Int?
     var inputToken: Data?
     // Windows RDP expects the v5+ nonce from the first client TSRequest.
     let clientNonce = credSSPNonce()
@@ -2904,6 +2964,10 @@ private func performCredSSPHandshake(
             }
         }
 
+        if ProcessInfo.processInfo.environment["RDPKIT_DEBUG_CREDSSP"] == "1" {
+            let hex = request.encoded().map { String(format: "%02x", $0) }.joined()
+            FileHandle.standardError.write(Data("[credssp→] v\(negotiatedVersion) \(hex)\n".utf8))
+        }
         try sendApplicationPacket(request.encoded(), on: channel)
         if step.isComplete {
             break
@@ -2916,23 +2980,37 @@ private func performCredSSPHandshake(
             cancellation: cancellation,
             shouldCancel: shouldCancel
         )
+        if ProcessInfo.processInfo.environment["RDPKIT_DEBUG_CREDSSP"] == "1" {
+            FileHandle.standardError.write(Data("[credssp←] v\(response.version) tokens=\(response.negoTokens.count) pubKeyAuth=\(response.pubKeyAuth != nil) error=\(response.errorCode.map { String(format: "0x%08x", $0) } ?? "-")\n".utf8))
+        }
         try validateCredSSP(response)
-        negotiatedVersion = try effectiveCredSSPVersion(response.version)
+        serverReportedVersion = response.version
+        negotiatedVersion = try effectiveCredSSPVersion(response.version, legacyMode: legacyMode)
         guard let serverToken = response.negoTokens.last else {
             throw RDPCredSSPError.missingToken
         }
         inputToken = try RDPSPNEGO.mechanismToken(from: serverToken)
     }
 
-    let bindingResponse = try receiveCredSSPMessage(
-        on: channel,
-        reader: reader,
-        timeoutSeconds: timeoutSeconds,
-        cancellation: cancellation,
-        shouldCancel: shouldCancel
-    )
+    let bindingResponse: RDPCredSSPTSRequest
+    do {
+        bindingResponse = try receiveCredSSPMessage(
+            on: channel,
+            reader: reader,
+            timeoutSeconds: timeoutSeconds,
+            cancellation: cancellation,
+            shouldCancel: shouldCancel
+        )
+    } catch RDPPreflightError.receive(_) where !legacyMode && serverReportedVersion == 5 {
+        // Windows Server 2008 R2 meldet v5, schließt aber nach v5-pubKeyAuth kommentarlos (kein 4624/4625).
+        // Es akzeptiert nur das Legacy-Binding – und nur, wenn schon die erste Nachricht v3 ohne Nonce war.
+        throw RDPCredSSPError.legacyServerRejectedModernBinding
+    }
+    if ProcessInfo.processInfo.environment["RDPKIT_DEBUG_CREDSSP"] == "1" {
+        FileHandle.standardError.write(Data("[credssp←] binding v\(bindingResponse.version) pubKeyAuth=\(bindingResponse.pubKeyAuth != nil) error=\(bindingResponse.errorCode.map { String(format: "0x%08x", $0) } ?? "-")\n".utf8))
+    }
     try validateCredSSP(bindingResponse)
-    negotiatedVersion = try effectiveCredSSPVersion(bindingResponse.version)
+    negotiatedVersion = try effectiveCredSSPVersion(bindingResponse.version, legacyMode: legacyMode)
     guard let serverPubKeyAuth = bindingResponse.pubKeyAuth else {
         throw RDPCredSSPError.missingPubKeyAuth
     }
@@ -3001,11 +3079,13 @@ private func validateCredSSP(_ response: RDPCredSSPTSRequest) throws {
     }
 }
 
-private func effectiveCredSSPVersion(_ version: Int) throws -> Int {
+func effectiveCredSSPVersion(_ version: Int, legacyMode: Bool = false) throws -> Int {
     guard version >= 2 else {
         throw RDPCredSSPError.unsupportedVersion(version)
     }
-    return min(version, 6)
+    // Spike-Diagnose: Höchstversion begrenzen (alte Server).
+    let maximum = ProcessInfo.processInfo.environment["RDPKIT_CREDSSP_MAX_VERSION"].flatMap(Int.init) ?? 6
+    return min(version, legacyMode ? min(3, maximum) : maximum)
 }
 
 private func credSSPNonce() -> Data {
@@ -3923,6 +4003,7 @@ private func performMCSConnectionSequence(
                             graphicsResponseData: graphicsResult?.graphicsResponseData,
                             graphicsResponse: graphicsResult?.graphicsResponse,
                             graphicsCapsConfirm: graphicsResult?.graphicsCapsConfirm,
+                            graphicsLegacyBitmapMode: graphicsResult?.legacyBitmapMode ?? false,
                             graphicsUpdateResponseCount: graphicsResult?.graphicsUpdateResponseCount ?? 0,
                             graphicsUpdateResponseData: graphicsResult?.graphicsUpdateResponseData ?? [],
                             graphicsUpdateMessages: graphicsResult?.graphicsUpdateMessages ?? [],
@@ -4333,12 +4414,59 @@ private func performRDPGraphicsDynamicChannelHandshake(
                 timeoutSeconds: timeoutSeconds,
                 timeoutDescription: "RDP Graphics Dynamic Channel Request"
             )
+            if ProcessInfo.processInfo.environment["RDPKIT_DEBUG_CREDSSP"] == "1" {
+                let head = packet.prefix(24).map { String(format: "%02x", $0) }.joined(separator: " ")
+                let bitmap = (try? packetCarriesBitmapUpdate(packet, ioChannelID: ioChannelID)) ?? false
+                FileHandle.standardError.write(Data("[gfx-wait] \(packet.count) B bitmap=\(bitmap) \(head)\n".utf8))
+            }
 
             guard let staticPDU = try RDPStaticVirtualChannelPDU.parseIfPresent(
                 fromTPKT: packet,
                 channelID: staticChannelID,
                 maximumChunkByteCount: maximumStaticVirtualChannelChunkSize
             ) else {
+                if result.graphicsCapsConfirm == nil,
+                   try packetCarriesBitmapUpdate(packet, ioChannelID: ioChannelID)
+                {
+                    // Server ohne (aktives) RDPGFX, z. B. 2008 R2: klassische Bitmap-Updates verarbeiten.
+                    result.legacyBitmapMode = true
+                    try receiveRDPGraphicsUpdateBatch(
+                        shareID: shareID,
+                        userChannelID: userChannelID,
+                        ioChannelID: ioChannelID,
+                        staticChannelID: staticChannelID,
+                        maximumStaticVirtualChannelChunkSize: maximumStaticVirtualChannelChunkSize,
+                        maximumFastPathFragmentByteCount: maximumFastPathFragmentByteCount,
+                        dynamicChannelID: result.graphicsChannelCreateRequest?.channelID ?? 0,
+                        on: channel,
+                        reader: reader,
+                        timeoutSeconds: timeoutSeconds,
+                        frameCaptureLimit: frameCaptureLimit,
+                        desktopWidth: desktopWidth,
+                        desktopHeight: desktopHeight,
+                        onGraphicsFrame: onGraphicsFrame,
+                        onRemotePointer: onRemotePointer,
+                        onDisplayControlReady: onDisplayControlReady,
+                        clipboardSession: clipboardSession,
+                        audioSession: audioSession,
+                        onClipboardReady: onClipboardReady,
+                        onClipboardText: onClipboardText,
+                        onClipboardFileGroupDescriptor: onClipboardFileGroupDescriptor,
+                        onClipboardFileContents: onClipboardFileContents,
+                        onAudioSample: onAudioSample,
+                        dynamicAudioSession: dynamicAudioSession,
+                        deviceRedirectionSession: deviceRedirectionSession,
+                        cancellation: cancellation,
+                        shouldCancel: shouldCancel,
+                        graphicsTransport: graphicsTransport,
+                        dynamicChannelDecompressors: dynamicChannelDecompressors,
+                        dynamicChannelNegotiatedVersion: result.dynamicChannelNegotiatedVersion,
+                        graphicsCapabilitySet: RDPGraphicsCapabilityProfile.legacy.capabilitySets[0],
+                        initialPacket: packet,
+                        result: &result
+                    )
+                    return result
+                }
                 if let shareData = try RDPShareDataPDU.parseIfPresent(fromTPKT: packet),
                    let errorInfo = shareData.errorInfo
                 {
@@ -5596,8 +5724,10 @@ private func receiveRDPGraphicsUpdateBatch(
     dynamicChannelDecompressors initialDynamicChannelDecompressors: [UInt32: RDPZGFXDecompressor],
     dynamicChannelNegotiatedVersion: UInt16?,
     graphicsCapabilitySet: RDPGFXCapabilitySet,
+    initialPacket: Data? = nil,
     result: inout RDPGraphicsDynamicChannelResult
 ) throws {
+    var pendingInitialPacket = initialPacket
     var totalFramesDecoded: UInt32 = 0
     var logicalFrameTracker = RDPGFXLogicalFrameTracker()
     var fragment: RDPDynamicVirtualChannelFragment?
@@ -5777,6 +5907,10 @@ private func receiveRDPGraphicsUpdateBatch(
             : nil
         let packet: Data
         do {
+            if let initial = pendingInitialPacket {
+                pendingInitialPacket = nil
+                packet = initial
+            } else {
             packet = try receiveApplicationTPKT(
                 on: channel,
                 reader: reader,
@@ -5786,6 +5920,7 @@ private func receiveRDPGraphicsUpdateBatch(
                 shouldCancel: shouldCancel,
                 mapRemoteDisconnectToReceiveFailure: false
             )
+            }
         } catch RDPApplicationReceiveError.remoteDisconnected {
             if result.graphicsFrames.isEmpty == false,
                fragment == nil,
@@ -6151,6 +6286,26 @@ private func recordFastPathOutputPacketIfPresent(
     return true
 }
 
+/// Enthält das Paket ein Grafik-Update ohne RDPGFX (Bitmap-Update oder Surface Commands)?
+private func packetCarriesBitmapUpdate(_ packet: Data, ioChannelID: UInt16) throws -> Bool {
+    guard let first = packet.first else {
+        return false
+    }
+    if first & 0x03 == 0 {
+        guard let fastPath = try? RDPFastPathOutputPDU.parse(packet) else {
+            return false
+        }
+        // 2008 R2 schickt Surface Commands (SetSurfaceBits, z. B. NSCodec), ältere Server Bitmap-Updates.
+        return fastPath.updates.contains { $0.updateCode == .bitmap || $0.updateCode == .surfaceCommands }
+    }
+    guard let shareData = try? RDPShareDataPDU.parseIfPresent(fromTPKT: packet, channelID: ioChannelID),
+          case .bitmap = shareData.graphicsUpdate
+    else {
+        return false
+    }
+    return true
+}
+
 private func recordSlowPathGraphicsUpdatePacketIfPresent(
     _ packet: Data,
     result: inout RDPGraphicsDynamicChannelResult,
@@ -6270,7 +6425,18 @@ private func processRDPGraphicsUpdatePayload(
                 }
 
                 if wire.codecID == RDPGFXCodecID.avc444 || wire.codecID == RDPGFXCodecID.avc444v2 {
-                    let avc444 = try RDPGFXAVC444BitmapStream.parse(from: wire.bitmapData)
+                    let avc444: RDPGFXAVC444BitmapStream
+                    do {
+                        avc444 = try RDPGFXAVC444BitmapStream.parse(from: wire.bitmapData)
+                    } catch {
+                        // Spike-Diagnose: dekomprimierte Bitmap-Daten für Offline-Reproduktion sichern.
+                        if let dir = ProcessInfo.processInfo.environment["RDPKIT_DEBUG_DUMP_DIR"] {
+                            let url = URL(fileURLWithPath: dir).appendingPathComponent("avc444-\(Date().timeIntervalSince1970).bin")
+                            try? wire.bitmapData.write(to: url)
+                            FileHandle.standardError.write(Data("[avc444-dump] \(url.path)\n".utf8))
+                        }
+                        throw error
+                    }
                     let frameID = logicalFrameTracker.activeFrameID
                     let firstStream = avc444.firstStream
                     let secondStream = avc444.secondStream
@@ -6368,6 +6534,13 @@ private func processRDPGraphicsUpdatePayload(
             }
         }
     } catch {
+        // Spike-Diagnose: fehlschlagende, bereits dekomprimierte RDPGFX-Nachricht sichern.
+        if let dir = ProcessInfo.processInfo.environment["RDPKIT_DEBUG_DUMP_DIR"], let messageIndex {
+            let message = graphicsMessages[messageIndex]
+            let url = URL(fileURLWithPath: dir).appendingPathComponent("rdpgfx-cmd\(message.commandID)-\(Date().timeIntervalSince1970).bin")
+            try? message.payload.write(to: url)
+            FileHandle.standardError.write(Data("[rdpgfx-dump] \(url.path) error=\(error)\n".utf8))
+        }
         recordRDPGraphicsFailure(
             payload: payload,
             messages: graphicsMessages,

@@ -162,11 +162,14 @@ final class RDPCredSSPNTLMContext {
             from: challenge.targetInfo,
             channelBindingsHash: channelBindingsHash
         )
-        let lmChallengeResponse = Self.lmV2Response(
-            serverChallenge: challenge.serverChallenge,
-            clientChallenge: clientChallenge,
-            ntlmV2Hash: ntlmV2Hash
-        )
+        // Spike-Diagnose: Z(24) statt LMv2, wie Windows bei vorhandenem MsvAvTimestamp.
+        let lmChallengeResponse = ProcessInfo.processInfo.environment["RDPKIT_NTLM_ZERO_LM"] == "1"
+            ? Data(repeating: 0, count: 24)
+            : Self.lmV2Response(
+                serverChallenge: challenge.serverChallenge,
+                clientChallenge: clientChallenge,
+                ntlmV2Hash: ntlmV2Hash
+            )
         let ntChallenge = Self.ntlmV2Response(
             serverChallenge: challenge.serverChallenge,
             clientChallenge: clientChallenge,

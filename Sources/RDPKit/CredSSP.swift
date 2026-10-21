@@ -430,9 +430,12 @@ enum RDPCredSSPError: Error, CustomStringConvertible {
     case ntlm(String)
     case serverError(UInt32)
     case serverBindingMismatch
+    case legacyServerRejectedModernBinding
 
     var description: String {
         switch self {
+        case .legacyServerRejectedModernBinding:
+            "server closed the connection after the CredSSP v5 public key binding; retrying with legacy CredSSP"
         case .missingCredentials:
             "CredSSP requires credentials"
         case let .unsupportedVersion(version):

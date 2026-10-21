@@ -46,7 +46,8 @@ final class MockKRDPServer {
         audioEnabled: Bool = false,
         waitForCompatibilityTraffic: Bool = false,
         requireBitmapCodecsCapability: Bool = false,
-        skipChannelJoinSupported: Bool = false
+        skipChannelJoinSupported: Bool = false,
+        credSSPBehavior: MockCredSSPBehavior = .modern
     ) throws -> MockKRDPServer {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let transcript = MockKRDPServerTranscript()
@@ -73,6 +74,7 @@ final class MockKRDPServer {
                         waitForCompatibilityTraffic: waitForCompatibilityTraffic,
                         requireBitmapCodecsCapability: requireBitmapCodecsCapability,
                         skipChannelJoinSupported: skipChannelJoinSupported,
+                        credSSPBehavior: credSSPBehavior,
                         transcript: transcript,
                         connectionLog: connectionLog
                     ))
@@ -114,6 +116,15 @@ enum MockKRDPSecurityProtocol {
     case failure(code: UInt32)
 }
 
+/// Fork: CredSSP-Verhalten des Mock-Servers (Windows Server 2008 R2 meldet v5, akzeptiert aber nur Legacy-Binding).
+enum MockCredSSPBehavior {
+    case modern
+    /// Meldet v5, schließt nach nonce-gebundenem pubKeyAuth, akzeptiert v3 ohne Nonce von der ersten Nachricht an.
+    case legacyBindingOnly
+    /// Meldet v6 und schließt nach NTLM AUTHENTICATE.
+    case closeAfterAuthenticate
+}
+
 enum MockKRDPGraphicsBehavior: Equatable {
     case sendFirstFrame
     case sendPointerUpdatesBeforeFirstFrame
@@ -137,6 +148,10 @@ enum MockKRDPGraphicsBehavior: Equatable {
     case closeAfterFirstFrame
     case setErrorInfoLogoffBeforeFrame
     case stallAfterCapsConfirm
+    // Fork: Server ohne RDPGFX (2008 R2) schickt Fast-Path-Grafik statt des DRDYNVC-Capabilities-Requests.
+    case sendLegacySurfaceCommandsWithoutRDPGFX
+    case sendLegacyBitmapUpdateWithoutRDPGFX
+    case sendFastPathPointerBeforeFirstFrame
 }
 
 enum MockKRDPGraphicsCapabilitySelection {
@@ -437,6 +452,8 @@ final class MockCredSSPServer {
 
     private let credentials: RDPCredentials
     private let transcript: MockKRDPServerTranscript
+    private let behavior: MockCredSSPBehavior
+    private var legacyBinding = false
     private let subjectPublicKey: Data
     private let channelBindingsHash: Data
     private let serverChallenge = Data([0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF])
@@ -451,9 +468,14 @@ final class MockCredSSPServer {
     private var sendSequenceNumber: UInt32 = 0
     private var receiveSequenceNumber: UInt32 = 0
 
-    init(credentials: RDPCredentials, transcript: MockKRDPServerTranscript) throws {
+    init(
+        credentials: RDPCredentials,
+        transcript: MockKRDPServerTranscript,
+        behavior: MockCredSSPBehavior = .modern
+    ) throws {
         self.credentials = credentials
         self.transcript = transcript
+        self.behavior = behavior
         subjectPublicKey = try MockKRDPTLS.subjectPublicKey()
         channelBindingsHash = try MockKRDPTLS.ntlmChannelBindingsHash()
     }
@@ -471,6 +493,18 @@ final class MockCredSSPServer {
         case .negotiate:
             transcript.recordCredSSPMessage("ntlm-negotiate")
             let negotiateToken = try request.negoTokens.last.map(RDPSPNEGO.mechanismToken(from:))
+            if behavior == .legacyBindingOnly, request.version == 3, request.clientNonce == nil {
+                guard negotiateToken?.starts(with: Data("NTLMSSP\u{0}".utf8)) == true else {
+                    throw MockKRDPServerError.invalidClientPDU
+                }
+                transcript.recordCredSSPGate("legacy-v3-negotiate-without-nonce")
+                legacyBinding = true
+                stage = .authenticate
+                return RDPCredSSPTSRequest(
+                    version: serverVersion,
+                    negoTokens: [RDPSPNEGO.negTokenResponse(responseToken: challengeMessage())]
+                ).encoded()
+            }
             guard let nonce = request.clientNonce,
                   nonce.count == 32,
                   negotiateToken?.starts(with: Data("NTLMSSP\u{0}".utf8)) == true
@@ -484,7 +518,7 @@ final class MockCredSSPServer {
             clientNonce = nonce
             stage = .authenticate
             return RDPCredSSPTSRequest(
-                version: 6,
+                version: serverVersion,
                 negoTokens: [RDPSPNEGO.negTokenResponse(responseToken: challengeMessage())]
             ).encoded()
 
@@ -508,6 +542,26 @@ final class MockCredSSPServer {
                 throw MockKRDPServerError.invalidClientPDU
             }
             let binding = try unwrap(clientPubKeyAuth)
+            if behavior == .closeAfterAuthenticate {
+                transcript.recordCredSSPGate("closed-after-authenticate")
+                throw MockKRDPServerError.invalidClientPDU
+            }
+            if legacyBinding {
+                guard request.version == 3, request.clientNonce == nil, binding == subjectPublicKey else {
+                    throw MockKRDPServerError.invalidClientPDU
+                }
+                transcript.recordCredSSPGate("legacy-pubkeyauth")
+                stage = .credentials
+                return try RDPCredSSPTSRequest(
+                    version: serverVersion,
+                    pubKeyAuth: wrap(RDPCredSSPPublicKeyBinding.legacyServerResponse(subjectPublicKey: subjectPublicKey))
+                ).encoded()
+            }
+            if behavior == .legacyBindingOnly {
+                // Wie 2008 R2: Verbindung kommentarlos schließen, kein errorCode.
+                transcript.recordCredSSPGate("rejected-modern-binding")
+                throw MockKRDPServerError.invalidClientPDU
+            }
             guard binding == RDPCredSSPPublicKeyBinding.clientServerHash(
                 subjectPublicKey: subjectPublicKey,
                 nonce: clientNonce
@@ -517,7 +571,7 @@ final class MockCredSSPServer {
             transcript.recordCredSSPGate("nonce-bound-pubkeyauth")
             stage = .credentials
             return try RDPCredSSPTSRequest(
-                version: 6,
+                version: serverVersion,
                 pubKeyAuth: wrap(RDPCredSSPPublicKeyBinding.serverClientHash(
                     subjectPublicKey: subjectPublicKey,
                     nonce: clientNonce
@@ -540,6 +594,10 @@ final class MockCredSSPServer {
         case .complete:
             throw MockKRDPServerError.invalidClientPDU
         }
+    }
+
+    private var serverVersion: Int {
+        behavior == .legacyBindingOnly ? 5 : 6
     }
 
     private func challengeMessage() -> Data {
@@ -974,6 +1032,7 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
     private let waitForCompatibilityTraffic: Bool
     private let requireBitmapCodecsCapability: Bool
     private let skipChannelJoinSupported: Bool
+    private let credSSPBehavior: MockCredSSPBehavior
     private let transcript: MockKRDPServerTranscript
     private let connectionLog: MockKRDPConnectionLog
     private var connectionIndex = 0
@@ -1001,6 +1060,7 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
         waitForCompatibilityTraffic: Bool,
         requireBitmapCodecsCapability: Bool,
         skipChannelJoinSupported: Bool,
+        credSSPBehavior: MockCredSSPBehavior,
         transcript: MockKRDPServerTranscript,
         connectionLog: MockKRDPConnectionLog
     ) {
@@ -1020,6 +1080,7 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
         self.waitForCompatibilityTraffic = waitForCompatibilityTraffic
         self.requireBitmapCodecsCapability = requireBitmapCodecsCapability
         self.skipChannelJoinSupported = skipChannelJoinSupported
+        self.credSSPBehavior = credSSPBehavior
         self.transcript = transcript
         self.connectionLog = connectionLog
     }
@@ -1150,7 +1211,11 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
                 writePacket(MockKRDPFixtures.x224ConnectionConfirm(selectedProtocols: .credSSP), context: context)
                 let tlsHandler = NIOSSLServerHandler(context: tlsContext)
                 try context.channel.pipeline.syncOperations.addHandler(tlsHandler, position: .first)
-                credSSPServer = try MockCredSSPServer(credentials: credentials, transcript: transcript)
+                credSSPServer = try MockCredSSPServer(
+                    credentials: credentials,
+                    transcript: transcript,
+                    behavior: credSSPBehavior
+                )
                 stage = .credSSP
             case let .credSSPWithEarlyUserAuth(credentials, _):
                 writePacket(
@@ -1159,7 +1224,11 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
                 )
                 let tlsHandler = NIOSSLServerHandler(context: tlsContext)
                 try context.channel.pipeline.syncOperations.addHandler(tlsHandler, position: .first)
-                credSSPServer = try MockCredSSPServer(credentials: credentials, transcript: transcript)
+                credSSPServer = try MockCredSSPServer(
+                    credentials: credentials,
+                    transcript: transcript,
+                    behavior: credSSPBehavior
+                )
                 stage = .credSSP
             case .rdSTLS:
                 writePacket(MockKRDPFixtures.x224ConnectionConfirm(selectedProtocols: .rdSTLS), context: context)
@@ -1515,13 +1584,17 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
                  .sendSoftSyncBeforeFrame,
                  .sendUnknownCloseBeforeFrame,
                  .closeAfterFirstFrame,
-                 .setErrorInfoLogoffBeforeFrame:
+                 .setErrorInfoLogoffBeforeFrame,
+                 .sendFastPathPointerBeforeFirstFrame:
                 releaseGraphicsFrame(context: context)
                 stage = .graphicsFrameAcknowledge
             case .sendEmptyFrameThenStall:
                 writePacket(MockKRDPFixtures.graphicsEmptyFrameUpdate(), context: context)
                 stage = .graphicsFrameAcknowledge
-            case .stallAfterCapsConfirm, .stallAfterFragmentedCapsConfirm:
+            case .stallAfterCapsConfirm,
+                 .stallAfterFragmentedCapsConfirm,
+                 .sendLegacySurfaceCommandsWithoutRDPGFX,
+                 .sendLegacyBitmapUpdateWithoutRDPGFX:
                 stage = .done
             }
 
@@ -1822,6 +1895,21 @@ private final class MockKRDPServerHandler: ChannelInboundHandler {
         }
 
         didReleaseGraphicsHandshake = true
+        switch graphicsBehavior {
+        case .sendLegacySurfaceCommandsWithoutRDPGFX:
+            writePacket(MockKRDPFixtures.fastPathPointerDefault(), context: context)
+            writePacket(MockKRDPFixtures.fastPathSurfaceCommandsFrame(), context: context)
+            stage = .done
+            return
+        case .sendLegacyBitmapUpdateWithoutRDPGFX:
+            writePacket(MockKRDPFixtures.fastPathBitmapUpdate(), context: context)
+            stage = .done
+            return
+        case .sendFastPathPointerBeforeFirstFrame:
+            writePacket(MockKRDPFixtures.fastPathPointerDefault(), context: context)
+        default:
+            break
+        }
         writePacket(MockKRDPFixtures.dynamicCapabilitiesRequest(version: dynamicChannelVersion), context: context)
     }
 
@@ -2628,7 +2716,8 @@ private enum MockKRDPFixtures {
         case .sendFirstFrame,
              .sendCompressedCapsConfirmFirstFrame,
              .sendFragmentedCompressedCapsConfirmFirstFrame,
-             .closeAfterFirstFrame:
+             .closeAfterFirstFrame,
+             .sendFastPathPointerBeforeFirstFrame:
             [graphicsDynamicPacket(avc420FrameMessages())]
         case .sendPointerUpdatesBeforeFirstFrame:
             [pointerColorUpdate(), cachedPointerUpdate(), graphicsDynamicPacket(avc420FrameMessages())]
@@ -2669,9 +2758,88 @@ private enum MockKRDPFixtures {
             ]
         case .sendEmptyFrameThenStall:
             [graphicsEmptyFrameUpdate()]
-        case .stallAfterCapsConfirm, .stallAfterFragmentedCapsConfirm:
+        case .stallAfterCapsConfirm,
+             .stallAfterFragmentedCapsConfirm,
+             .sendLegacySurfaceCommandsWithoutRDPGFX,
+             .sendLegacyBitmapUpdateWithoutRDPGFX:
             []
         }
+    }
+
+    static func fastPathPointerDefault() -> Data {
+        fastPathPacket(fastPathUpdate(code: RDPFastPathUpdateCode.pointerDefault.rawValue, payload: Data()))
+    }
+
+    /// Frame-Marker + SetSurfaceBits (roh, 32 bpp, 2×2) + Frame-Marker, wie 2008 R2 ohne RDPGFX.
+    static func fastPathSurfaceCommandsFrame(frameID: UInt32 = 7) -> Data {
+        func frameMarker(action: UInt16) -> Data {
+            var data = Data()
+            data.appendLittleEndianUInt16(0x0004)
+            data.appendLittleEndianUInt16(action)
+            data.appendLittleEndianUInt32(frameID)
+            return data
+        }
+        let pixels = Data([
+            0x01, 0x02, 0x03, 0xFF, 0x04, 0x05, 0x06, 0xFF,
+            0x07, 0x08, 0x09, 0xFF, 0x0A, 0x0B, 0x0C, 0xFF,
+        ])
+        var surfaceBits = Data()
+        surfaceBits.appendLittleEndianUInt16(0x0001)
+        surfaceBits.appendLittleEndianUInt16(0)
+        surfaceBits.appendLittleEndianUInt16(0)
+        surfaceBits.appendLittleEndianUInt16(2)
+        surfaceBits.appendLittleEndianUInt16(2)
+        surfaceBits.appendUInt8(32)
+        surfaceBits.appendUInt8(0)
+        surfaceBits.appendUInt8(0)
+        surfaceBits.appendUInt8(0)
+        surfaceBits.appendLittleEndianUInt16(2)
+        surfaceBits.appendLittleEndianUInt16(2)
+        surfaceBits.appendLittleEndianUInt32(UInt32(pixels.count))
+        surfaceBits.append(pixels)
+        let payload = frameMarker(action: 0) + surfaceBits + frameMarker(action: 1)
+        return fastPathPacket(fastPathUpdate(code: RDPFastPathUpdateCode.surfaceCommands.rawValue, payload: payload))
+    }
+
+    /// Klassisches Bitmap-Update (unkomprimiert, 32 bpp, 1×1).
+    static func fastPathBitmapUpdate() -> Data {
+        let bitmap = Data([0x11, 0x22, 0x33, 0x44])
+        var payload = Data()
+        payload.appendLittleEndianUInt16(0x0001)
+        payload.appendLittleEndianUInt16(1)
+        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(1)
+        payload.appendLittleEndianUInt16(1)
+        payload.appendLittleEndianUInt16(32)
+        payload.appendLittleEndianUInt16(0)
+        payload.appendLittleEndianUInt16(UInt16(bitmap.count))
+        payload.append(bitmap)
+        return fastPathPacket(fastPathUpdate(code: RDPFastPathUpdateCode.bitmap.rawValue, payload: payload))
+    }
+
+    private static func fastPathPacket(_ updates: Data) -> Data {
+        let length = 1 + (updates.count + 2 < 0x80 ? 1 : 2) + updates.count
+        var data = Data()
+        data.appendUInt8(0x00)
+        if length < 0x80 {
+            data.appendUInt8(UInt8(length))
+        } else {
+            data.appendUInt8(0x80 | UInt8((length >> 8) & 0x7F))
+            data.appendUInt8(UInt8(length & 0xFF))
+        }
+        data.append(updates)
+        return data
+    }
+
+    private static func fastPathUpdate(code: UInt8, payload: Data) -> Data {
+        var data = Data()
+        data.appendUInt8(code)
+        data.appendLittleEndianUInt16(UInt16(payload.count))
+        data.append(payload)
+        return data
     }
 
     static func avc420FrameMessages() -> Data {
