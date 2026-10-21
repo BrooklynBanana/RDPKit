@@ -979,6 +979,8 @@ public enum RDPPreflightError: Error, CustomStringConvertible {
     case protocolViolation(String)
     /// Early User Authorization (HYBRID_EX): Server hat den Benutzer nach NLA abgewiesen (ACCESS_DENIED).
     case earlyUserAuthorizationDenied
+    /// TCP connection not established within the configured timeout.
+    case connectTimedOut(seconds: Int)
     case cancelled
 
     public var description: String {
@@ -997,6 +999,8 @@ public enum RDPPreflightError: Error, CustomStringConvertible {
             message
         case .earlyUserAuthorizationDenied:
             "early user authorization denied access"
+        case let .connectTimedOut(seconds):
+            "connect timed out after \(seconds) s"
         case .cancelled:
             "cancelled"
         }
@@ -2029,7 +2033,8 @@ private func throwIfCancelled(
     }
 }
 
-private func openSocket(host: String, port: UInt16, timeoutSeconds: Int) throws -> Int32 {
+private func openSocket(host: String, port: UInt16, timeoutSeconds: Int,
+                        cancellation: RDPConnectionCancellation? = nil) throws -> Int32 {
     var hints = addrinfo(
         ai_flags: 0,
         ai_family: AF_UNSPEC,
@@ -2048,30 +2053,31 @@ private func openSocket(host: String, port: UInt16, timeoutSeconds: Int) throws 
     defer { freeaddrinfo(result) }
 
     var current: UnsafeMutablePointer<addrinfo>? = result
-    var lastError = "no addresses"
+    var lastError: any Error = RDPPreflightError.connect("no addresses")
 
     while let address = current {
         let fd = socket(address.pointee.ai_family, address.pointee.ai_socktype, address.pointee.ai_protocol)
         if fd < 0 {
-            lastError = String(cString: strerror(errno))
+            lastError = RDPPreflightError.connect(String(cString: strerror(errno)))
             current = address.pointee.ai_next
             continue
         }
 
         do {
             try configureTimeout(fd: fd, timeoutSeconds: timeoutSeconds)
-            guard Darwin.connect(fd, address.pointee.ai_addr, address.pointee.ai_addrlen) == 0 else {
-                throw RDPPreflightError.connect(String(cString: strerror(errno)))
-            }
+            try connect(fd: fd, to: address.pointee, timeoutSeconds: timeoutSeconds, cancellation: cancellation)
             return fd
+        } catch RDPPreflightError.cancelled {
+            close(fd)
+            throw RDPPreflightError.cancelled
         } catch {
-            lastError = String(describing: error)
+            lastError = error
             close(fd)
             current = address.pointee.ai_next
         }
     }
 
-    throw RDPPreflightError.connect(lastError)
+    throw lastError
 }
 
 private func connectAndNegotiate(
@@ -2083,7 +2089,7 @@ private func connectAndNegotiate(
     wireTranscript: RDPWireTranscript?,
     cancellation: RDPConnectionCancellation?
 ) throws -> NegotiatedConnection {
-    let fd = try openSocket(host: host, port: port, timeoutSeconds: timeoutSeconds)
+    let fd = try openSocket(host: host, port: port, timeoutSeconds: timeoutSeconds, cancellation: cancellation)
     let cancellationRegistration = cancellation?.register {
         _ = Darwin.shutdown(fd, SHUT_RDWR)
     }
@@ -2104,6 +2110,37 @@ private func connectAndNegotiate(
         cancellationRegistration?.cancel()
         close(fd)
         throw error
+    }
+}
+
+/// Non-blocking connect with `poll`: SO_SNDTIMEO does not limit a blocking `connect()` on Darwin, which would wait for
+/// the system TCP timeout (~75 s) and could not be cancelled.
+private func connect(fd: Int32, to address: addrinfo, timeoutSeconds: Int,
+                     cancellation: RDPConnectionCancellation?) throws {
+    let flags = fcntl(fd, F_GETFL, 0)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    defer { _ = fcntl(fd, F_SETFL, flags) }
+    if Darwin.connect(fd, address.ai_addr, address.ai_addrlen) == 0 { return }
+    guard errno == EINPROGRESS else { throw RDPPreflightError.connect(String(cString: strerror(errno))) }
+    let deadline = Date().addingTimeInterval(TimeInterval(max(timeoutSeconds, 1)))
+    while true {
+        if cancellation?.isCancelled == true { throw RDPPreflightError.cancelled }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw RDPPreflightError.connectTimedOut(seconds: max(timeoutSeconds, 1)) }
+        var descriptor = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        let ready = poll(&descriptor, 1, Int32(min(remaining, 0.2) * 1000))
+        if ready < 0 {
+            if errno == EINTR { continue }
+            throw RDPPreflightError.connect(String(cString: strerror(errno)))
+        }
+        if ready == 0 { continue }
+        var socketError: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &socketError, &length) == 0 else {
+            throw RDPPreflightError.connect(String(cString: strerror(errno)))
+        }
+        guard socketError == 0 else { throw RDPPreflightError.connect(String(cString: strerror(socketError))) }
+        return
     }
 }
 
