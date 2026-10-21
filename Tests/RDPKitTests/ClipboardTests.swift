@@ -346,7 +346,7 @@ import Testing
     let fittingResponse = try #require(RDPClipboardFormatDataResponsePDU.unicodeTextIfEncodable(fittingText))
 
     #expect(RDPClipboardLimits.canPublishUnicodeText(fittingText))
-    #expect(RDPStaticVirtualChannelPDU.canEncodeSinglePayload(fittingResponse.encoded()))
+    #expect(fittingResponse.encoded().count <= RDPClipboardLimits.maximumMessageByteCount)
 
     let oversizedText = fittingText + "a"
 

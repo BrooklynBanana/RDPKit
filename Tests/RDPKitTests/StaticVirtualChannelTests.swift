@@ -325,3 +325,24 @@ private extension UInt32 {
     static let first = RDPStaticVirtualChannelFlags.first
     static let last = RDPStaticVirtualChannelFlags.last
 }
+
+@Test func staticVirtualChannelSplitsLargeMessagesIntoChunks() throws {
+    let payload = Data((0 ..< 4_000).map { UInt8($0 % 251) })
+    let chunks = RDPStaticVirtualChannelPDU.chunks(for: payload, flags: RDPStaticVirtualChannelFlags.showProtocol)
+    #expect(chunks.map(\.payload.count) == [1_600, 1_600, 800])
+    #expect(chunks.allSatisfy { $0.totalLength == 4_000 })
+    #expect(chunks[0].flags == RDPStaticVirtualChannelFlags.first | RDPStaticVirtualChannelFlags.showProtocol)
+    #expect(chunks[1].flags == RDPStaticVirtualChannelFlags.showProtocol)
+    #expect(chunks[2].flags == RDPStaticVirtualChannelFlags.last | RDPStaticVirtualChannelFlags.showProtocol)
+
+    var reassembler = RDPStaticVirtualChannelReassembler()
+    var complete: RDPStaticVirtualChannelPDU?
+    for chunk in chunks {
+        let parsed = try RDPStaticVirtualChannelPDU.parse(fromUserData: chunk.encodedUserData())
+        complete = try reassembler.append(parsed)
+    }
+    #expect(complete?.payload == payload)
+
+    let small = RDPStaticVirtualChannelPDU.chunks(for: Data([1, 2, 3]), flags: RDPStaticVirtualChannelFlags.showProtocol)
+    #expect(small.count == 1 && small[0].flags == RDPStaticVirtualChannelFlags.completeWithShowProtocol)
+}

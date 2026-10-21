@@ -514,8 +514,8 @@ struct RDPClipboardFormatDataRequestPDU: Equatable, Sendable {
 }
 
 struct RDPClipboardFormatDataResponsePDU: Equatable, Sendable {
-    static let maximumDataByteCount = RDPStaticVirtualChannelPDU.maximumPayloadByteCount
-        - RDPClipboardPDU.headerByteCount
+    /// Larger responses are sent in several channel chunks.
+    static let maximumDataByteCount = RDPClipboardLimits.maximumMessageByteCount - RDPClipboardPDU.headerByteCount
 
     var ok: Bool
     var data: Data
@@ -885,6 +885,8 @@ public struct RDPClipboardLocalFile: Equatable, Sendable {
 }
 
 public enum RDPClipboardLimits {
+    /// Upper bound for one outgoing clipboard message (text or a file range), sent in channel chunks.
+    public static let maximumMessageByteCount = 64 * 1024 * 1024
     public static let maximumUnicodeTextByteCount = RDPClipboardFormatDataResponsePDU.maximumDataByteCount
 
     public static let maximumUnicodeTextUTF16CodeUnitCount = max(0, maximumUnicodeTextByteCount / 2 - 1)
@@ -1294,18 +1296,17 @@ public final class RDPClipboardSession: @unchecked Sendable {
 
     @discardableResult
     private func send(_ payload: Data) -> Bool {
-        guard RDPStaticVirtualChannelPDU.canEncodeSinglePayload(payload) else {
+        guard payload.count <= RDPClipboardLimits.maximumMessageByteCount else {
             return false
         }
 
-        let packet = RDPStaticVirtualChannelPDU(
-            payload: payload,
-            flags: RDPStaticVirtualChannelFlags.first
-                | RDPStaticVirtualChannelFlags.last
-                | RDPStaticVirtualChannelFlags.showProtocol
+        let packets = RDPStaticVirtualChannelPDU.chunks(
+            for: payload,
+            flags: RDPStaticVirtualChannelFlags.showProtocol
         )
-            .encodedTPKT(initiator: userChannelID, channelID: staticChannelID)
+            .map { $0.encodedTPKT(initiator: userChannelID, channelID: staticChannelID) }
         if let sentMessageHandler,
+           let packet = packets.first,
            let pdu = try? RDPClipboardPDU.parse(from: payload)
         {
             sentMessageHandler(.summarize(pdu), packet)
@@ -1314,9 +1315,12 @@ public final class RDPClipboardSession: @unchecked Sendable {
             guard self.channel.isActive else {
                 return
             }
-            var buffer = self.channel.allocator.buffer(capacity: packet.count)
-            buffer.writeBytes(packet)
-            self.channel.writeAndFlush(buffer, promise: nil)
+            for packet in packets {
+                var buffer = self.channel.allocator.buffer(capacity: packet.count)
+                buffer.writeBytes(packet)
+                self.channel.write(buffer, promise: nil)
+            }
+            self.channel.flush()
         }
         return true
     }

@@ -175,6 +175,26 @@ struct RDPStaticVirtualChannelPDU: Equatable, Sendable {
         )
     }
 
+    /// Splits a message into channel chunks of at most `maximumPayloadByteCount` bytes (CHANNEL_FLAG_FIRST/LAST,
+    /// MS-RDPBCGR 3.1.5.2.1); every chunk carries the total length. A message that fits stays a single PDU.
+    static func chunks(for payload: Data, flags extraFlags: UInt32 = 0) -> [RDPStaticVirtualChannelPDU] {
+        precondition(payload.count <= Int(UInt32.max))
+        let totalLength = UInt32(payload.count)
+        var chunks: [RDPStaticVirtualChannelPDU] = []
+        var offset = payload.startIndex
+        repeat {
+            let end = payload.index(offset, offsetBy: maximumPayloadByteCount, limitedBy: payload.endIndex)
+                ?? payload.endIndex
+            var flags = extraFlags
+            if offset == payload.startIndex { flags |= RDPStaticVirtualChannelFlags.first }
+            if end == payload.endIndex { flags |= RDPStaticVirtualChannelFlags.last }
+            chunks.append(RDPStaticVirtualChannelPDU(totalLength: totalLength, flags: flags,
+                                                     payload: Data(payload[offset ..< end])))
+            offset = end
+        } while offset < payload.endIndex
+        return chunks
+    }
+
     fileprivate init(totalLength: UInt32, flags: UInt32, payload: Data) {
         self.totalLength = totalLength
         self.flags = flags
