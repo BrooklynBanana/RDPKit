@@ -47,9 +47,12 @@ enum RDPDeviceRedirectionPacketID {
 public struct RDPRedirectedDrive: Equatable, Sendable {
     /// Anzeigename; für den DOS-Namen werden unzulässige und Nicht-ASCII-Zeichen ersetzt.
     public var name: String
+    /// Ordner auf dem Mac; ohne Ordner wird das Laufwerk nur angekündigt (Zugriffe: nicht unterstützt).
+    public var directory: URL?
 
-    public init(name: String) {
+    public init(name: String, directory: URL? = nil) {
         self.name = name
+        self.directory = directory
     }
 
     /// Name ohne die in MS-RDPEFS 2.2.1.3 verbotenen Zeichen, nur ASCII (wie FreeRDP).
@@ -523,6 +526,10 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     private var announcedClientID: UInt32?
     /// Antwort des Servers je angekündigtem Gerät (NTSTATUS; 0 = angenommen).
     private(set) var deviceReplies: [UInt32: UInt32] = [:]
+    /// Laufwerke mit Ordner; Datei-IRPs laufen nacheinander auf `driveQueue`, nicht auf dem Netzwerk-Thread.
+    private let devices: [UInt32: RDPDriveDevice]
+    private let driveQueue = DispatchQueue(label: "rdpkit.rdpdr.drive")
+    private var reassembler = RDPStaticVirtualChannelReassembler()
 
     init(
         userChannelID: UInt16,
@@ -536,6 +543,20 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
         self.channel = channel
         self.computerName = computerName
         self.drives = drives.enumerated().map { (UInt32($0.offset + 1), $0.element) }
+        var devices: [UInt32: RDPDriveDevice] = [:]
+        for (id, drive) in self.drives {
+            if let directory = drive.directory {
+                devices[id] = RDPDriveDevice(deviceID: id, name: drive.sanitizedName, root: directory)
+            }
+        }
+        self.devices = devices
+    }
+
+    /// Setzt geteilte Kanal-Nachrichten zusammen (Schreib-Anforderungen sind größer als ein Kanal-Teil).
+    func reassemble(_ pdu: RDPStaticVirtualChannelPDU) throws -> RDPStaticVirtualChannelPDU? {
+        lock.lock()
+        defer { lock.unlock() }
+        return try reassembler.append(pdu)
     }
 
     private var deviceList: RDPDeviceRedirectionDeviceListAnnounce {
@@ -606,7 +627,13 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
 
         case RDPDeviceRedirectionPacketID.deviceIORequest:
             guard let request = try RDPDeviceIORequest.parse(from: pdu) else { return }
-            send(request.notSupportedCompletion())
+            guard let device = devices[request.deviceID] else {
+                send(request.notSupportedCompletion())
+                return
+            }
+            driveQueue.async { [self] in
+                if let reply = device.handle(request) { send(reply) }
+            }
 
         default:
             return
@@ -619,16 +646,20 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
         return minorVersion
     }
 
+    /// Sendet in Kanal-Teilen (Lese-Antworten sind größer als ein Teil).
     private func send(_ payload: Data) {
-        let packet = RDPStaticVirtualChannelPDU(payload: payload)
-            .encodedTPKT(initiator: userChannelID, channelID: staticChannelID)
+        let packets = RDPStaticVirtualChannelPDU.chunks(for: payload)
+            .map { $0.encodedTPKT(initiator: userChannelID, channelID: staticChannelID) }
         channel.eventLoop.execute {
             guard self.channel.isActive else {
                 return
             }
-            var buffer = self.channel.allocator.buffer(capacity: packet.count)
-            buffer.writeBytes(packet)
-            self.channel.writeAndFlush(buffer, promise: nil)
+            for packet in packets {
+                var buffer = self.channel.allocator.buffer(capacity: packet.count)
+                buffer.writeBytes(packet)
+                self.channel.write(buffer, promise: nil)
+            }
+            self.channel.flush()
         }
     }
 }

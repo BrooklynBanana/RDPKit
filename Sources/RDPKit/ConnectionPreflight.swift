@@ -5702,14 +5702,12 @@ private func handleDeviceRedirectionPacket(
     ) else {
         return false
     }
-    guard staticPDU.canDispatchPayload else {
-        if staticPDU.isFlowControl {
-            return true
-        }
-        throw RDPDecodeError.invalidStaticVirtualChannelPDU
+    // Geteilte Nachrichten (z. B. Schreib-Anforderungen der Laufwerksumleitung) erst zusammensetzen.
+    guard let completePDU = try session.reassemble(staticPDU) else {
+        return true
     }
 
-    let deviceRedirectionPDU = try RDPDeviceRedirectionPDU.parse(from: staticPDU.payload)
+    let deviceRedirectionPDU = try RDPDeviceRedirectionPDU.parse(from: completePDU.payload)
     try session.receive(deviceRedirectionPDU)
     return true
 }
