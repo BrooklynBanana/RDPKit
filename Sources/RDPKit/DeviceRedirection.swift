@@ -43,6 +43,37 @@ enum RDPDeviceRedirectionPacketID {
     }
 }
 
+/// Umgeleiteter Ordner (Connection Manager): erscheint auf dem Server als `\\tsclient\<name>`.
+public struct RDPRedirectedDrive: Equatable, Sendable {
+    /// Anzeigename; für den DOS-Namen werden unzulässige und Nicht-ASCII-Zeichen ersetzt.
+    public var name: String
+
+    public init(name: String) {
+        self.name = name
+    }
+
+    /// Name ohne die in MS-RDPEFS 2.2.1.3 verbotenen Zeichen, nur ASCII (wie FreeRDP).
+    var sanitizedName: String {
+        let forbidden: Set<Character> = [":", "<", ">", "\"", "/", "\\", "|", " "]
+        let mapped = name.map { character -> Character in
+            guard character.isASCII, !forbidden.contains(character),
+                  let scalar = character.unicodeScalars.first, scalar.value >= 0x20 else { return "_" }
+            return character
+        }
+        let result = String(mapped)
+        return result.isEmpty ? "_" : result
+    }
+}
+
+enum RDPDeviceType {
+    static let filesystem: UInt32 = 0x0000_0008
+}
+
+enum RDPNTStatus {
+    static let success: UInt32 = 0x0000_0000
+    static let notSupported: UInt32 = 0xC000_00BB
+}
+
 enum RDPDeviceRedirectionVersion {
     static let major: UInt16 = 0x0001
     static let minorRDP5: UInt16 = 0x0002
@@ -240,12 +271,19 @@ struct RDPDeviceRedirectionClientNameRequest: Equatable, Sendable {
 
 struct RDPDeviceRedirectionClientCapabilities: Equatable, Sendable {
     var minorVersion: UInt16
+    /// Laufwerke werden umgeleitet → Drive-Capability mitsenden.
+    var drives = false
 
     func encoded() -> Data {
         var payload = Data()
-        payload.appendLittleEndianUInt16(1)
+        payload.appendLittleEndianUInt16(drives ? 2 : 1)
         payload.appendLittleEndianUInt16(0)
         payload.append(generalCapabilityEncoded())
+        if drives {
+            payload.appendLittleEndianUInt16(RDPDeviceRedirectionCapability.driveType)
+            payload.appendLittleEndianUInt16(RDPDeviceRedirectionCapability.headerLength)
+            payload.appendLittleEndianUInt32(RDPDeviceRedirectionCapability.driveVersion2)
+        }
         return RDPDeviceRedirectionPDU(
             header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.clientCapability),
             payload: payload
@@ -403,11 +441,72 @@ struct RDPDeviceRedirectionServerCapabilities: Equatable, Sendable {
 }
 
 struct RDPDeviceRedirectionDeviceListAnnounce: Equatable, Sendable {
+    /// Laufwerke mit Geräte-ID (ab 1).
+    var drives: [(id: UInt32, drive: RDPRedirectedDrive)] = []
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.drives.map(\.id) == rhs.drives.map(\.id) && lhs.drives.map(\.drive) == rhs.drives.map(\.drive)
+    }
+
     func encoded() -> Data {
         var payload = Data()
-        payload.appendLittleEndianUInt32(0)
+        payload.appendLittleEndianUInt32(UInt32(drives.count))
+        for (id, drive) in drives {
+            // DEVICE_ANNOUNCE: Typ, ID, PreferredDosName (8 Byte ASCII), DeviceData = voller Name (ASCII, nullterminiert)
+            let name = Array(drive.sanitizedName.utf8)
+            payload.appendLittleEndianUInt32(RDPDeviceType.filesystem)
+            payload.appendLittleEndianUInt32(id)
+            var dosName = Array(name.prefix(7))
+            dosName += Array(repeating: 0, count: 8 - dosName.count)
+            payload.append(contentsOf: dosName)
+            payload.appendLittleEndianUInt32(UInt32(name.count + 1))
+            payload.append(contentsOf: name)
+            payload.append(0)
+        }
         return RDPDeviceRedirectionPDU(
             header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.deviceListAnnounce),
+            payload: payload
+        ).encoded()
+    }
+}
+
+/// Geräte-E/A-Anforderung des Servers (DR_DEVICE_IOREQUEST, MS-RDPEFS 2.2.1.4).
+struct RDPDeviceIORequest: Equatable, Sendable {
+    static let majorCreate: UInt32 = 0x0000_0000
+
+    var deviceID: UInt32
+    var fileID: UInt32
+    var completionID: UInt32
+    var majorFunction: UInt32
+    var minorFunction: UInt32
+    var body: Data
+
+    static func parse(from pdu: RDPDeviceRedirectionPDU) throws -> RDPDeviceIORequest? {
+        guard pdu.header.component == RDPDeviceRedirectionComponent.core,
+              pdu.header.packetID == RDPDeviceRedirectionPacketID.deviceIORequest else { return nil }
+        guard pdu.payload.count >= 20 else { throw RDPDecodeError.invalidStaticVirtualChannelPDU }
+        var cursor = ByteCursor(pdu.payload)
+        return try RDPDeviceIORequest(
+            deviceID: cursor.readLittleEndianUInt32(),
+            fileID: cursor.readLittleEndianUInt32(),
+            completionID: cursor.readLittleEndianUInt32(),
+            majorFunction: cursor.readLittleEndianUInt32(),
+            minorFunction: cursor.readLittleEndianUInt32(),
+            body: cursor.readRemainingData()
+        )
+    }
+
+    /// Antwort „nicht unterstützt“ (bis die Laufwerksumleitung Dateien bedient). Create erwartet FileId und
+    /// Information, alle anderen mindestens ein 32-Bit-Längenfeld.
+    func notSupportedCompletion() -> Data {
+        var payload = Data()
+        payload.appendLittleEndianUInt32(deviceID)
+        payload.appendLittleEndianUInt32(completionID)
+        payload.appendLittleEndianUInt32(RDPNTStatus.notSupported)
+        payload.appendLittleEndianUInt32(0)
+        if majorFunction == Self.majorCreate { payload.append(0) }
+        return RDPDeviceRedirectionPDU(
+            header: RDPDeviceRedirectionHeader(packetID: RDPDeviceRedirectionPacketID.deviceIOCompletion),
             payload: payload
         ).encoded()
     }
@@ -418,20 +517,35 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     private let userChannelID: UInt16
     private let channel: Channel
     private let computerName: String
+    private let drives: [(id: UInt32, drive: RDPRedirectedDrive)]
     private let lock = NSLock()
     private var minorVersion = RDPDeviceRedirectionVersion.minorRDP6
     private var announcedClientID: UInt32?
+    /// Antwort des Servers je angekündigtem Gerät (NTSTATUS; 0 = angenommen).
+    private(set) var deviceReplies: [UInt32: UInt32] = [:]
 
     init(
         userChannelID: UInt16,
         staticChannelID: UInt16,
         channel: Channel,
-        computerName: String
+        computerName: String,
+        drives: [RDPRedirectedDrive] = []
     ) {
         self.userChannelID = userChannelID
         self.staticChannelID = staticChannelID
         self.channel = channel
         self.computerName = computerName
+        self.drives = drives.enumerated().map { (UInt32($0.offset + 1), $0.element) }
+    }
+
+    private var deviceList: RDPDeviceRedirectionDeviceListAnnounce {
+        RDPDeviceRedirectionDeviceListAnnounce(drives: drives)
+    }
+
+    func deviceReply(for deviceID: UInt32) -> UInt32? {
+        lock.lock()
+        defer { lock.unlock() }
+        return deviceReplies[deviceID]
     }
 
     func receive(_ pdu: RDPDeviceRedirectionPDU) throws {
@@ -456,7 +570,8 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
 
         case RDPDeviceRedirectionPacketID.serverCapability:
             _ = try RDPDeviceRedirectionServerCapabilities.parse(from: pdu)
-            send(RDPDeviceRedirectionClientCapabilities(minorVersion: currentMinorVersion()).encoded())
+            send(RDPDeviceRedirectionClientCapabilities(minorVersion: currentMinorVersion(),
+                                                        drives: !drives.isEmpty).encoded())
 
         case RDPDeviceRedirectionPacketID.clientIDConfirm:
             if let confirm = try RDPDeviceRedirectionVersionAndID.parse(from: pdu) {
@@ -470,7 +585,7 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
                     throw RDPDecodeError.invalidStaticVirtualChannelPDU
                 }
                 if confirm.minor == RDPDeviceRedirectionVersion.minorRDP51 {
-                    send(RDPDeviceRedirectionDeviceListAnnounce().encoded())
+                    send(deviceList.encoded())
                 }
             }
 
@@ -478,7 +593,20 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
             guard pdu.payload.isEmpty else {
                 throw RDPDecodeError.invalidStaticVirtualChannelPDU
             }
-            send(RDPDeviceRedirectionDeviceListAnnounce().encoded())
+            send(deviceList.encoded())
+
+        case RDPDeviceRedirectionPacketID.deviceReply:
+            guard pdu.payload.count == 8 else { throw RDPDecodeError.invalidStaticVirtualChannelPDU }
+            var cursor = ByteCursor(pdu.payload)
+            let deviceID = try cursor.readLittleEndianUInt32()
+            let status = try cursor.readLittleEndianUInt32()
+            lock.lock()
+            deviceReplies[deviceID] = status
+            lock.unlock()
+
+        case RDPDeviceRedirectionPacketID.deviceIORequest:
+            guard let request = try RDPDeviceIORequest.parse(from: pdu) else { return }
+            send(request.notSupportedCompletion())
 
         default:
             return

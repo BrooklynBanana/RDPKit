@@ -108,6 +108,8 @@ struct MCSConnectInitialConfiguration: Equatable, Sendable {
     var audioPlaybackEnabled: Bool
     var redirectedSessionID: UInt32?
     var storedClientLicense: RDPStoredClientLicense?
+    /// Laufwerksumleitung (Connection Manager) – für die rdpdr-Sitzung.
+    var redirectedDrives: [RDPRedirectedDrive] = []
 
     init(
         desktopWidth: UInt16 = 1280,

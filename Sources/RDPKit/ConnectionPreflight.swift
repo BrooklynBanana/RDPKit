@@ -137,6 +137,8 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
     /// Fehler aus TLS/CredSSP/Early User Authorization als typisierte Fehler werfen (z. B. `RDPCredSSPError.serverError`
     /// mit NTSTATUS) statt sie nur als Text im Bericht zu liefern. Standard aus (bisheriges Verhalten).
     public var throwsSecurityErrors: Bool = false
+    /// Mac-Ordner, die der Server als `\\tsclient\<Name>` sieht (Laufwerksumleitung, MS-RDPEFS). Connection Manager.
+    public var redirectedDrives: [RDPRedirectedDrive] = []
 
     public init(
         host: String,
@@ -219,8 +221,10 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
         if clipboardEnabled {
             channels.append(.cliprdr)
         }
-        if audioPlaybackEnabled {
+        if audioPlaybackEnabled || !redirectedDrives.isEmpty {
             channels.append(.rdpdr)
+        }
+        if audioPlaybackEnabled {
             channels.append(.rdpsnd)
         }
         return channels
@@ -1164,7 +1168,7 @@ public struct RDPPreflightClient: Sendable {
         if usesTLS {
             callerOwnsConnectionFD = false
             do {
-                let mcsConfiguration = MCSConnectInitialConfiguration(
+                var mcsConfiguration = MCSConnectInitialConfiguration(
                     desktopWidth: configuration.desktopWidth,
                     desktopHeight: configuration.desktopHeight,
                     selectedProtocol: selectedSecurityProtocols ?? .tls,
@@ -1176,6 +1180,7 @@ public struct RDPPreflightClient: Sendable {
                     redirectedSessionID: configuration.redirectionSessionID,
                     storedClientLicense: configuration.storedClientLicense
                 )
+                mcsConfiguration.redirectedDrives = configuration.redirectedDrives
                 let tls = try performTLSHandshake(
                     fd: connection.fd,
                     host: configuration.host,
@@ -3918,7 +3923,8 @@ private func performMCSConnectionSequence(
                                 userChannelID: userChannelID,
                                 staticChannelID: $0,
                                 channel: channel,
-                                computerName: configuration.clientName
+                                computerName: configuration.clientName,
+                                drives: configuration.redirectedDrives
                             )
                         }
                         var clipboardMessageData: [Data] = []

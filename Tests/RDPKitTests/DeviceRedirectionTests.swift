@@ -1,4 +1,5 @@
 import Foundation
+import NIOCore
 import NIOEmbedded
 @testable import RDPKit
 import Testing
@@ -302,4 +303,79 @@ private func generalCapabilityPayload(
     data.appendLittleEndianUInt32(extraFlags2)
     data.appendLittleEndianUInt32(0)
     return data
+}
+
+// MARK: Laufwerksumleitung (Connection Manager)
+
+@Test func deviceRedirectionClientCapabilitiesAnnounceDriveSupport() {
+    let encoded = RDPDeviceRedirectionClientCapabilities(
+        minorVersion: RDPDeviceRedirectionVersion.minorRDP6, drives: true
+    ).encoded()
+    // Zwei Capabilities, die zweite: CAP_DRIVE_TYPE, Länge 8, DRIVE_CAPABILITY_VERSION_02
+    #expect(encoded.prefix(8).rdpHexString == "72 44 50 43 02 00 00 00")
+    #expect(encoded.suffix(8).rdpHexString == "04 00 08 00 02 00 00 00")
+    #expect(encoded.count == 8 + 44 + 8)
+}
+
+@Test func deviceRedirectionDeviceListAnnouncesFilesystemDrive() {
+    let encoded = RDPDeviceRedirectionDeviceListAnnounce(
+        drives: [(id: 1, drive: RDPRedirectedDrive(name: "Mac"))]
+    ).encoded()
+    #expect(encoded.rdpHexString == """
+    72 44 41 44 01 00 00 00 08 00 00 00 01 00 00 00 \
+    4d 61 63 00 00 00 00 00 04 00 00 00 4d 61 63 00
+    """)
+}
+
+@Test func deviceRedirectionLongDriveNameKeepsFullNameInDeviceData() {
+    let encoded = RDPDeviceRedirectionDeviceListAnnounce(
+        drives: [(id: 7, drive: RDPRedirectedDrive(name: "ConnectionManager"))]
+    ).encoded()
+    // DOS-Name: höchstens 7 Zeichen + Null; voller Name in DeviceData
+    #expect(encoded[16 ..< 24].rdpHexString == "43 6f 6e 6e 65 63 74 00")
+    #expect(Data(encoded.suffix(18)) == Data("ConnectionManager".utf8) + Data([0]))
+}
+
+@Test func deviceRedirectionDriveNamesAreSanitized() {
+    #expect(RDPRedirectedDrive(name: "Mein Mac: Ä/x").sanitizedName == "Mein_Mac____x")
+    #expect(RDPRedirectedDrive(name: "").sanitizedName == "_")
+}
+
+@Test func deviceRedirectionSessionAnnouncesDrivesAndAnswersIORequests() throws {
+    let channel = EmbeddedChannel()
+    let session = RDPDeviceRedirectionSession(
+        userChannelID: 1006,
+        staticChannelID: 1004,
+        channel: channel,
+        computerName: "RDPKIT",
+        drives: [RDPRedirectedDrive(name: "Mac")]
+    )
+    try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 3389)).wait()
+    try session.receive(RDPDeviceRedirectionPDU.parse(from: Data([0x72, 0x44, 0x4C, 0x55])))   // user logged on
+    channel.embeddedEventLoop.run()
+    let announce = try #require(try channel.readOutbound(as: ByteBuffer.self))
+    let announceBytes = Data(announce.readableBytesView)
+    #expect(announceBytes.suffix(32).prefix(8).rdpHexString == "72 44 41 44 01 00 00 00")
+
+    // Server nimmt das Laufwerk an
+    try session.receive(RDPDeviceRedirectionPDU.parse(from: Data([
+        0x72, 0x44, 0x72, 0x64, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ])))
+    #expect(session.deviceReply(for: 1) == 0)
+
+    // IRP_MJ_CREATE → STATUS_NOT_SUPPORTED mit FileId und Information
+    var irp = Data([0x72, 0x44, 0x52, 0x49])
+    irp.appendLittleEndianUInt32(1)      // DeviceId
+    irp.appendLittleEndianUInt32(0)      // FileId
+    irp.appendLittleEndianUInt32(42)     // CompletionId
+    irp.appendLittleEndianUInt32(0)      // MajorFunction: Create
+    irp.appendLittleEndianUInt32(0)      // MinorFunction
+    irp.append(Data(repeating: 0, count: 32))
+    try session.receive(RDPDeviceRedirectionPDU.parse(from: irp))
+    channel.embeddedEventLoop.run()
+    let completion = try #require(try channel.readOutbound(as: ByteBuffer.self))
+    #expect(Data(completion.readableBytesView).suffix(21).rdpHexString == """
+    72 44 43 49 01 00 00 00 2a 00 00 00 bb 00 00 c0 00 00 00 00 00
+    """)
+    _ = try channel.finish()
 }
