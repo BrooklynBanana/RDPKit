@@ -78,6 +78,10 @@ private enum InformationClass {
     static let standard: UInt32 = 5
     static let names: UInt32 = 12
     static let attributeTag: UInt32 = 35
+    static let rename: UInt32 = 10
+    static let disposition: UInt32 = 13
+    static let allocation: UInt32 = 19
+    static let endOfFile: UInt32 = 20
 
     static let fsVolume: UInt32 = 1
     static let fsSize: UInt32 = 3
@@ -184,7 +188,7 @@ final class RDPDriveDevice: @unchecked Sendable {
             case RDPIRPMajor.lockControl:
                 return completion(request, status: RDPNTStatus.success, Data(count: 5))
             case RDPIRPMajor.setInformation:
-                return completion(request, status: RDPNTStatus.notSupported, uint32(0) + Data(count: 1))
+                return try setInformation(request, body: &body)
             default:
                 return completion(request, status: RDPNTStatus.notSupported, uint32(0))
             }
@@ -300,7 +304,103 @@ final class RDPDriveDevice: @unchecked Sendable {
     private func close(_ fileID: UInt32) {
         guard let file = files.removeValue(forKey: fileID) else { return }
         try? file.handle?.close()
-        if file.deleteOnClose { try? FileManager.default.removeItem(at: file.url) }
+        // Nur die Datei bzw. einen leeren Ordner – Windows löscht Ordnerinhalte vorher selbst, Datei für Datei.
+        if file.deleteOnClose { _ = file.isDirectory ? rmdir(file.url.path) : unlink(file.url.path) }
+    }
+
+    // MARK: Set Information (Umbenennen, Löschen, Größe, Zeitstempel)
+
+    private func setInformation(_ request: RDPDeviceIORequest, body: inout ByteCursor) throws -> Data {
+        let infoClass = try body.readLittleEndianUInt32()
+        let length = try body.readLittleEndianUInt32()
+        _ = try body.readData(count: 24)   // Padding
+        let buffer = try body.readData(count: Int(length))
+        var input = ByteCursor(buffer)
+        func reply(_ status: UInt32) -> Data { completion(request, status: status, uint32(length)) }
+        guard var file = files[request.fileID] else { return reply(RDPNTStatus.invalidHandle) }
+
+        switch infoClass {
+        case InformationClass.basic:
+            guard length >= 36 else { return reply(RDPNTStatus.invalidParameter) }
+            _ = try input.readLittleEndianUInt64()   // CreationTime (macOS: nicht setzbar)
+            let accessTime = try input.readLittleEndianUInt64()
+            let writeTime = try input.readLittleEndianUInt64()
+            _ = try input.readLittleEndianUInt64()   // ChangeTime
+            // Zeitstempel setzen, 0 = unverändert; Attribute (Schreibschutz …) übernimmt der Mac nicht.
+            var times = [Darwin.timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), Darwin.timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT))]
+            if let spec = Self.unixTime(fileTime: accessTime) { times[0] = spec }
+            if let spec = Self.unixTime(fileTime: writeTime) { times[1] = spec }
+            guard utimensat(AT_FDCWD, file.url.path, &times, 0) == 0 else { return reply(Self.status(errno: errno)) }
+            return reply(RDPNTStatus.success)
+
+        case InformationClass.endOfFile, InformationClass.allocation:
+            guard length >= 8 else { return reply(RDPNTStatus.invalidParameter) }
+            let size = try input.readLittleEndianUInt64()
+            guard !file.isDirectory else { return reply(RDPNTStatus.fileIsADirectory) }
+            // Belegte Größe kleiner als die Datei kürzt sie (MS-FSCC 2.4.4); größer ändert nichts.
+            if infoClass == InformationClass.allocation {
+                let current = RDPDriveFileInfo.load(file.url, name: file.url.lastPathComponent)?.size ?? 0
+                guard size < current else { return reply(RDPNTStatus.success) }
+            }
+            try? file.handle?.synchronize()
+            guard truncate(file.url.path, off_t(clamping: size)) == 0 else { return reply(Self.status(errno: errno)) }
+            return reply(RDPNTStatus.success)
+
+        case InformationClass.disposition:
+            let deletePending = length == 0 ? true : try input.readUInt8() != 0
+            if deletePending {
+                if file.isDirectory,
+                   let entries = try? FileManager.default.contentsOfDirectory(atPath: file.url.path), !entries.isEmpty {
+                    return reply(RDPNTStatus.directoryNotEmpty)
+                }
+                guard access(file.url.deletingLastPathComponent().path, W_OK) == 0 else {
+                    return reply(RDPNTStatus.accessDenied)
+                }
+            }
+            file.deleteOnClose = deletePending
+            files[request.fileID] = file
+            return reply(RDPNTStatus.success)
+
+        case InformationClass.rename:
+            guard length >= 6 else { return reply(RDPNTStatus.invalidParameter) }
+            let replaceIfExists = try input.readUInt8() != 0
+            _ = try input.readUInt8()   // RootDirectory
+            let nameLength = try input.readLittleEndianUInt32()
+            let newPath = try Self.readPath(&input, length: nameLength)
+            guard let target = resolve(newPath), target.path != root.path else { return reply(RDPNTStatus.accessDenied) }
+            let sameItem = target.path.lowercased() == file.url.path.lowercased()   // nur Groß-/Kleinschreibung
+            if !sameItem, FileManager.default.fileExists(atPath: target.path) {
+                guard replaceIfExists else { return reply(RDPNTStatus.objectNameCollision) }
+                var isDirectory: ObjCBool = false
+                FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+                guard !isDirectory.boolValue else { return reply(RDPNTStatus.accessDenied) }
+            }
+            guard FileManager.default.fileExists(atPath: target.deletingLastPathComponent().path) else {
+                return reply(RDPNTStatus.objectPathNotFound)
+            }
+            try? file.handle?.close()
+            file.handle = nil
+            file.handleWritable = false
+            guard Darwin.rename(file.url.path, target.path) == 0 else { return reply(Self.status(errno: errno)) }
+            let oldPrefix = file.url.path
+            file.url = target
+            file.path = newPath
+            files[request.fileID] = file
+            // Offene Einträge darunter (Ordner umbenannt) mitziehen
+            for (id, other) in files where other.url.path.hasPrefix(oldPrefix + "/") {
+                files[id]?.url = URL(filePath: target.path + other.url.path.dropFirst(oldPrefix.count))
+            }
+            return reply(RDPNTStatus.success)
+
+        default:
+            return reply(RDPNTStatus.notSupported)
+        }
+    }
+
+    static func unixTime(fileTime: UInt64) -> Darwin.timespec? {
+        guard fileTime != 0, fileTime != UInt64.max else { return nil }
+        let seconds = Int64(fileTime / 10_000_000) - 11_644_473_600
+        return Darwin.timespec(tv_sec: Int(seconds), tv_nsec: Int(fileTime % 10_000_000) * 100)
     }
 
     // MARK: Read / Write
