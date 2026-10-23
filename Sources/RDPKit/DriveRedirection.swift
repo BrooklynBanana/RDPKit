@@ -136,7 +136,8 @@ final class RDPDriveDevice: @unchecked Sendable {
         var path: String
         var isDirectory: Bool
         var handle: FileHandle?
-        var writable: Bool
+        /// Die geöffnete `handle` kann schreiben (erst beim ersten Schreiben zum Schreiben geöffnet).
+        var handleWritable = false
         var listing: [RDPDriveFileInfo]?
         var listingIndex = 0
         var deleteOnClose = false
@@ -154,7 +155,7 @@ final class RDPDriveDevice: @unchecked Sendable {
         self.root = root.standardizedFileURL
     }
 
-    /// Antwort (DR_DEVICE_IOCOMPLETION) – `nil` bei Anfragen, die offen bleiben (Änderungsbenachrichtigung).
+    /// Antwort (DR_DEVICE_IOCOMPLETION); `nil` = keine Antwort (derzeit nicht genutzt).
     func handle(_ request: RDPDeviceIORequest) -> Data? {
         var body = ByteCursor(request.body)
         do {
@@ -173,7 +174,10 @@ final class RDPDriveDevice: @unchecked Sendable {
             case RDPIRPMajor.queryVolumeInformation:
                 return try queryVolume(request, body: &body)
             case RDPIRPMajor.directoryControl:
-                if request.minorFunction == RDPIRPMinor.notifyChangeDirectory { return nil }
+                // Änderungsbenachrichtigung nicht unterstützt (wie FreeRDP) – der Explorer liest dann bei Bedarf neu.
+                if request.minorFunction == RDPIRPMinor.notifyChangeDirectory {
+                    return completion(request, status: RDPNTStatus.notSupported, uint32(0))
+                }
                 return try queryDirectory(request, body: &body)
             case RDPIRPMajor.deviceControl:
                 return completion(request, status: RDPNTStatus.success, uint32(0))
@@ -285,12 +289,11 @@ final class RDPDriveDevice: @unchecked Sendable {
             }
         }
 
-        let writeAccess: UInt32 = 0x4000_0000 | 0x1000_0000 | 0x0000_0002 | 0x0000_0004 | 0x0200_0000
+        _ = desiredAccess   // Rechte prüft das Dateisystem beim Öffnen zum Lesen bzw. Schreiben
         let fileID = nextFileID
         nextFileID &+= 1
         files[fileID] = OpenFile(url: url, path: path, isDirectory: exists ? isDirectory.boolValue : wantsDirectory,
-                                 handle: nil, writable: desiredAccess & writeAccess != 0,
-                                 deleteOnClose: options & CreateOption.deleteOnClose != 0)
+                                 handle: nil, deleteOnClose: options & CreateOption.deleteOnClose != 0)
         return completion(request, status: RDPNTStatus.success, uint32(fileID) + Data([result]))
     }
 
@@ -304,11 +307,11 @@ final class RDPDriveDevice: @unchecked Sendable {
 
     private func handle(for fileID: UInt32, writing: Bool) throws -> FileHandle? {
         guard var file = files[fileID], !file.isDirectory else { return nil }
-        if let handle = file.handle, !writing || file.writable { return handle }
+        if let handle = file.handle, !writing || file.handleWritable { return handle }
         try? file.handle?.close()
         let handle = writing ? try FileHandle(forUpdating: file.url) : try FileHandle(forReadingFrom: file.url)
         file.handle = handle
-        if writing { file.writable = true }
+        file.handleWritable = writing
         files[fileID] = file
         return handle
     }
@@ -494,9 +497,10 @@ final class RDPDriveDevice: @unchecked Sendable {
             data.appendLittleEndianUInt32(UInt32(fileName.count))
             if infoClass != InformationClass.directory { data.appendLittleEndianUInt32(0) }   // EaSize
             if infoClass == InformationClass.bothDirectory {
-                data.append(0)                           // ShortNameLength
-                data.append(0)                           // Reserved
-                data.append(Data(count: 24))             // ShortName
+                // ShortNameLength + ShortName; das Reserved-Byte aus MS-FSCC sendet Windows über rdpdr nicht
+                // (wie FreeRDP) – sonst verschiebt sich der Name und der Explorer bricht ab.
+                data.append(0)
+                data.append(Data(count: 24))
             }
             data.append(fileName)
             return data

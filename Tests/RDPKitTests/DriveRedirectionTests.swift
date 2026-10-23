@@ -99,9 +99,9 @@ private struct DriveFixture {
             if reply.status == RDPNTStatus.noMoreFiles { return names }
             #expect(reply.status == 0)
             let entry = reply.output.dropFirst(4)
-            // FileNameLength bei Offset 60, Name ab 94 (FILE_BOTH_DIR_INFORMATION)
+            // FileNameLength bei Offset 60, Name ab 93 (FILE_BOTH_DIR_INFORMATION ohne Reserved-Byte)
             let nameLength = Int(entry[entry.startIndex + 60]) | Int(entry[entry.startIndex + 61]) << 8
-            let nameData = entry.dropFirst(94).prefix(nameLength)
+            let nameData = entry.dropFirst(93).prefix(nameLength)
             let units = stride(from: nameData.startIndex, to: nameData.endIndex, by: 2).map {
                 UInt16(nameData[$0]) | UInt16(nameData[$0 + 1]) << 8
             }
@@ -198,12 +198,12 @@ private struct DriveFixture {
         == RDPNTStatus.notSupported)
 }
 
-@Test func driveLeavesChangeNotificationsPending() throws {
+@Test func driveDeclinesChangeNotifications() throws {
     var fixture = try DriveFixture()
     defer { fixture.cleanUp() }
     let root = fixture.create("\\", options: 0x1)
     #expect(fixture.send(major: RDPIRPMajor.directoryControl, minor: RDPIRPMinor.notifyChangeDirectory,
-                         fileID: root.fileID, body: Data(count: 32)) == nil)
+                         fileID: root.fileID, body: Data(count: 32))?.status == RDPNTStatus.notSupported)
 }
 
 @Test func driveWildcardsMatchLikeWindows() {
@@ -221,4 +221,16 @@ private struct DriveFixture {
         result = try reassembler.append(chunk)
     }
     #expect(result?.payload == payload)
+}
+
+@Test func driveWritesAfterReadingTheSameHandle() throws {
+    var fixture = try DriveFixture()
+    defer { fixture.cleanUp() }
+    try Data("alt".utf8).write(to: fixture.root.appending(path: "notiz.txt"))
+    // wie der Windows-Editor: einmal öffnen (Lesen und Schreiben), erst lesen, dann schreiben
+    let opened = fixture.create("\\notiz.txt", disposition: 3, access: 0x0012_019F)
+    #expect(fixture.read(opened.fileID, length: 4096).output.dropFirst(4) == Data("alt".utf8))
+    #expect(fixture.write(opened.fileID, Data("neu!".utf8)).status == 0)
+    fixture.close(opened.fileID)
+    #expect(try Data(contentsOf: fixture.root.appending(path: "notiz.txt")) == Data("neu!".utf8))
 }
