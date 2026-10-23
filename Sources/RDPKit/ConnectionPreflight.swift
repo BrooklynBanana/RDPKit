@@ -139,6 +139,8 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
     public var throwsSecurityErrors: Bool = false
     /// Mac-Ordner, die der Server als `\\tsclient\<Name>` sieht (Laufwerksumleitung, MS-RDPEFS). Connection Manager.
     public var redirectedDrives: [RDPRedirectedDrive] = []
+    /// Name dieses Rechners für den Server (höchstens 15 Zeichen; Windows zeigt z. B. „Mac auf <Name>“).
+    public var clientName = "KRDPSWIFT"
 
     public init(
         host: String,
@@ -1181,6 +1183,7 @@ public struct RDPPreflightClient: Sendable {
                     storedClientLicense: configuration.storedClientLicense
                 )
                 mcsConfiguration.redirectedDrives = configuration.redirectedDrives
+                mcsConfiguration.clientName = configuration.clientName
                 let tls = try performTLSHandshake(
                     fd: connection.fd,
                     host: configuration.host,
