@@ -27,13 +27,28 @@ private struct DriveFixture {
         completion += 1
         let request = RDPDeviceIORequest(deviceID: 1, fileID: fileID, completionID: completion,
                                          majorFunction: major, minorFunction: minor, body: body)
-        guard let data = device.handle(request) else { return nil }
+        guard let data = device.queue.sync(execute: { device.handle(request) }) else { return nil }
+        let reply = Self.parse(data)
+        #expect(reply.completionID == completion)
+        return Reply(status: reply.status, output: reply.output)
+    }
+
+    static func parse(_ data: Data) -> (completionID: UInt32, status: UInt32, output: Data) {
         var cursor = ByteCursor(data)
         _ = try? cursor.readLittleEndianUInt32()   // Kopf
         _ = try? cursor.readLittleEndianUInt32()   // DeviceId
-        #expect((try? cursor.readLittleEndianUInt32()) == completion)
+        let completionID = (try? cursor.readLittleEndianUInt32()) ?? 0
         let status = (try? cursor.readLittleEndianUInt32()) ?? 0xFFFF_FFFF
-        return Reply(status: status, output: cursor.readRemainingData())
+        return (completionID, status, cursor.readRemainingData())
+    }
+
+    /// Änderungsbenachrichtigung anfordern; Rückgabe = sofortige Antwort (`nil` = bleibt offen).
+    mutating func notify(_ fileID: UInt32, watchTree: Bool = false) -> Reply? {
+        var body = Data([watchTree ? 1 : 0])
+        body.appendLittleEndianUInt32(0x17)
+        body.append(Data(count: 27))
+        return send(major: RDPIRPMajor.directoryControl, minor: RDPIRPMinor.notifyChangeDirectory, fileID: fileID,
+                    body: body)
     }
 
     mutating func create(_ path: String, disposition: UInt32 = 1, options: UInt32 = 0,
@@ -198,12 +213,81 @@ private struct DriveFixture {
         == RDPNTStatus.notSupported)
 }
 
-@Test func driveDeclinesChangeNotifications() throws {
+private final class LaterReplies: @unchecked Sendable {
+    private let lock = NSLock()
+    private var replies: [(completionID: UInt32, status: UInt32, output: Data)] = []
+
+    func append(_ data: Data) {
+        lock.withLock { replies.append(DriveFixture.parse(data)) }
+    }
+
+    /// Wartet bis zu `seconds` auf die Antwort zu `completionID`.
+    func wait(for completionID: UInt32, seconds: Double = 5) -> UInt32? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if let reply = lock.withLock({ replies.first { $0.completionID == completionID } }) { return reply.status }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return nil
+    }
+}
+
+@Test func driveNotifiesDirectoryChanges() throws {
+    var fixture = try DriveFixture()
+    defer { fixture.cleanUp() }
+    let later = LaterReplies()
+    fixture.device.sendLater = { later.append($0) }
+    try FileManager.default.createDirectory(at: fixture.root.appending(path: "sub/tief"), withIntermediateDirectories: true)
+    Thread.sleep(forTimeInterval: 1)   // FSEvents meldet sonst noch das Anlegen von „sub“
+    let root = fixture.create("\\", options: 0x1)
+    let sub = fixture.create("\\sub", options: 0x1)
+
+    // Ohne WatchTree: nur Änderungen direkt im Ordner
+    #expect(fixture.notify(root.fileID) == nil)
+    let rootWatch = fixture.completion
+    #expect(fixture.notify(sub.fileID, watchTree: true) == nil)
+    let subWatch = fixture.completion
+    Thread.sleep(forTimeInterval: 0.3)   // FSEvents läuft an
+    try Data("x".utf8).write(to: fixture.root.appending(path: "sub/tief/neu.txt"))
+    #expect(later.wait(for: subWatch) == RDPNTStatus.notifyEnumDir)
+    #expect(later.wait(for: rootWatch, seconds: 0.5) == nil)
+    try Data("y".utf8).write(to: fixture.root.appending(path: "oben.txt"))
+    #expect(later.wait(for: rootWatch) == RDPNTStatus.notifyEnumDir)
+
+    // Schließen beendet eine offene Benachrichtigung
+    #expect(fixture.notify(root.fileID) == nil)
+    let pending = fixture.completion
+    fixture.close(root.fileID)
+    #expect(later.wait(for: pending) == RDPNTStatus.notifyCleanup)
+}
+
+@Test func driveDeclinesChangeNotificationsWithoutAsyncReplies() throws {
     var fixture = try DriveFixture()
     defer { fixture.cleanUp() }
     let root = fixture.create("\\", options: 0x1)
-    #expect(fixture.send(major: RDPIRPMajor.directoryControl, minor: RDPIRPMinor.notifyChangeDirectory,
-                         fileID: root.fileID, body: Data(count: 32))?.status == RDPNTStatus.notSupported)
+    #expect(fixture.notify(root.fileID)?.status == RDPNTStatus.notSupported)
+}
+
+@Test func driveSetsReadOnlyAttribute() throws {
+    var fixture = try DriveFixture()
+    defer { fixture.cleanUp() }
+    let url = fixture.root.appending(path: "schutz.txt")
+    try Data().write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+    func basic(_ attributes: UInt32) -> Data {
+        var data = Data(count: 32)
+        data.appendLittleEndianUInt32(attributes)
+        return data
+    }
+    func mode() throws -> Int { try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as! Int }
+    let file = fixture.create("\\schutz.txt", access: 0x0000_0100)
+    #expect(fixture.setInformation(file.fileID, infoClass: 4, basic(0x21)) == 0)
+    #expect(try mode() == 0o444)
+    #expect(fixture.setInformation(file.fileID, infoClass: 4, basic(0)) == 0)   // 0 = unverändert
+    #expect(try mode() == 0o444)
+    #expect(fixture.setInformation(file.fileID, infoClass: 4, basic(0x80)) == 0)
+    #expect(try mode() == 0o644)
+    fixture.close(file.fileID)
 }
 
 @Test func driveWildcardsMatchLikeWindows() {

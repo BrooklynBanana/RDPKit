@@ -1,3 +1,4 @@
+import CoreServices
 import Darwin
 import Foundation
 
@@ -37,6 +38,8 @@ extension RDPNTStatus {
     static let invalidHandle: UInt32 = 0xC000_0008
     static let invalidParameter: UInt32 = 0xC000_000D
     static let noMoreFiles: UInt32 = 0x8000_0006
+    static let notifyCleanup: UInt32 = 0x0000_010B
+    static let notifyEnumDir: UInt32 = 0x0000_010C
 }
 
 private enum FileAttribute {
@@ -147,16 +150,33 @@ final class RDPDriveDevice: @unchecked Sendable {
         var deleteOnClose = false
     }
 
+    /// Offene Änderungsbenachrichtigung (IRP bleibt offen, bis sich im Ordner etwas ändert).
+    private struct PendingNotify {
+        var request: RDPDeviceIORequest
+        var directory: String
+        var watchTree: Bool
+    }
+
     let deviceID: UInt32
     let name: String
     let root: URL
+    /// Alle IRPs und Dateiänderungen laufen nacheinander hier (Zustand des Geräts nur auf dieser Warteschlange).
+    let queue = DispatchQueue(label: "rdpkit.rdpdr.drive")
+    /// Antworten, die später kommen (Änderungsbenachrichtigungen).
+    var sendLater: (@Sendable (Data) -> Void)?
     private var files: [UInt32: OpenFile] = [:]
     private var nextFileID: UInt32 = 1
+    private var pendingNotifies: [UInt32: [PendingNotify]] = [:]
+    private var eventStream: FSEventStreamRef?
 
     init(deviceID: UInt32, name: String, root: URL) {
         self.deviceID = deviceID
         self.name = name
         self.root = root.standardizedFileURL
+    }
+
+    deinit {
+        stopWatching()
     }
 
     /// Antwort (DR_DEVICE_IOCOMPLETION); `nil` = keine Antwort (derzeit nicht genutzt).
@@ -178,9 +198,8 @@ final class RDPDriveDevice: @unchecked Sendable {
             case RDPIRPMajor.queryVolumeInformation:
                 return try queryVolume(request, body: &body)
             case RDPIRPMajor.directoryControl:
-                // Änderungsbenachrichtigung nicht unterstützt (wie FreeRDP) – der Explorer liest dann bei Bedarf neu.
                 if request.minorFunction == RDPIRPMinor.notifyChangeDirectory {
-                    return completion(request, status: RDPNTStatus.notSupported, uint32(0))
+                    return try notifyChangeDirectory(request, body: &body)
                 }
                 return try queryDirectory(request, body: &body)
             case RDPIRPMajor.deviceControl:
@@ -199,6 +218,81 @@ final class RDPDriveDevice: @unchecked Sendable {
 
     func closeAll() {
         for id in Array(files.keys) { close(id) }
+        stopWatching()
+    }
+
+    // MARK: Änderungsbenachrichtigung
+
+    /// Bleibt offen; ändert sich etwas im Ordner (bzw. darunter bei WatchTree), kommt STATUS_NOTIFY_ENUM_DIR ohne
+    /// Einträge – der Explorer liest den Ordner dann neu ein. Beobachtet wird per FSEvents der ganze freigegebene Ordner.
+    private func notifyChangeDirectory(_ request: RDPDeviceIORequest, body: inout ByteCursor) throws -> Data? {
+        let watchTree = try body.readUInt8() != 0
+        guard let file = files[request.fileID], file.isDirectory, sendLater != nil,
+              let directory = Self.realPath(file.url) else {
+            return completion(request, status: RDPNTStatus.notSupported, uint32(0))
+        }
+        startWatching()
+        guard eventStream != nil else { return completion(request, status: RDPNTStatus.notSupported, uint32(0)) }
+        pendingNotifies[request.fileID, default: []].append(
+            PendingNotify(request: request, directory: directory, watchTree: watchTree))
+        return nil
+    }
+
+    /// Geänderte Pfade (FSEvents, auf `queue`).
+    func filesChanged(_ paths: [String]) {
+        for (fileID, notifies) in pendingNotifies {
+            var remaining: [PendingNotify] = []
+            for notify in notifies {
+                let hit = paths.contains { path in
+                    path == notify.directory
+                        || (path as NSString).deletingLastPathComponent == notify.directory
+                        || (notify.watchTree && path.hasPrefix(notify.directory + "/"))
+                }
+                if hit {
+                    sendLater?(completion(notify.request, status: RDPNTStatus.notifyEnumDir, uint32(0)))
+                } else {
+                    remaining.append(notify)
+                }
+            }
+            pendingNotifies[fileID] = remaining.isEmpty ? nil : remaining
+        }
+    }
+
+    private final class WeakDevice {
+        weak var device: RDPDriveDevice?
+        init(_ device: RDPDriveDevice) { self.device = device }
+    }
+
+    private func startWatching() {
+        guard eventStream == nil, let rootPath = Self.realPath(root) else { return }
+        let box = Unmanaged.passRetained(WeakDevice(self)).toOpaque()
+        var context = FSEventStreamContext(version: 0, info: box, retain: nil, release: { info in
+            if let info { Unmanaged<WeakDevice>.fromOpaque(info).release() }
+        }, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, paths, _, _ in
+            guard let info else { return }
+            let changed = unsafeBitCast(paths, to: NSArray.self).compactMap { $0 as? String }
+            Unmanaged<WeakDevice>.fromOpaque(info).takeUnretainedValue().device?.filesChanged(changed)
+        }
+        let flags = kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer
+        guard let stream = FSEventStreamCreate(nil, callback, &context, [rootPath] as CFArray,
+                                               FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.1,
+                                               FSEventStreamCreateFlags(flags)) else { return }
+        FSEventStreamSetDispatchQueue(stream, queue)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            return
+        }
+        eventStream = stream
+    }
+
+    private func stopWatching() {
+        guard let stream = eventStream else { return }
+        eventStream = nil
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
     }
 
     // MARK: Pfade
@@ -325,6 +419,9 @@ final class RDPDriveDevice: @unchecked Sendable {
     }
 
     private func close(_ fileID: UInt32) {
+        for notify in pendingNotifies.removeValue(forKey: fileID) ?? [] {
+            sendLater?(completion(notify.request, status: RDPNTStatus.notifyCleanup, uint32(0)))
+        }
         guard let file = files.removeValue(forKey: fileID) else { return }
         try? file.handle?.close()
         // Nur die Datei bzw. einen leeren Ordner – Windows löscht Ordnerinhalte vorher selbst, Datei für Datei.
@@ -349,7 +446,17 @@ final class RDPDriveDevice: @unchecked Sendable {
             let accessTime = try input.readLittleEndianUInt64()
             let writeTime = try input.readLittleEndianUInt64()
             _ = try input.readLittleEndianUInt64()   // ChangeTime
-            // Zeitstempel setzen, 0 = unverändert; Attribute (Schreibschutz …) übernimmt der Mac nicht.
+            let attributes = try input.readLittleEndianUInt32()
+            // Schreibschutz (nur Dateien) = Schreibrechte entfernen bzw. für den Besitzer wieder setzen; 0 = unverändert.
+            // Andere Attribute (versteckt, Archiv …) übernimmt der Mac nicht.
+            if attributes != 0, !file.isDirectory {
+                guard let current = try? FileManager.default.attributesOfItem(atPath: file.url.path)[.posixPermissions]
+                        as? Int else { return reply(RDPNTStatus.objectNameNotFound) }
+                let mode = mode_t(current & 0o7777)
+                let wanted = attributes & FileAttribute.readOnly != 0 ? mode & ~0o222 : mode | (mode & 0o222 == 0 ? 0o200 : 0)
+                if wanted != mode, chmod(file.url.path, wanted) != 0 { return reply(Self.status(errno: errno)) }
+            }
+            // Zeitstempel setzen, 0 = unverändert
             var times = [Darwin.timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), Darwin.timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT))]
             if let spec = Self.unixTime(fileTime: accessTime) { times[0] = spec }
             if let spec = Self.unixTime(fileTime: writeTime) { times[1] = spec }

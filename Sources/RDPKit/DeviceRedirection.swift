@@ -526,9 +526,8 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
     private var announcedClientID: UInt32?
     /// Antwort des Servers je angekündigtem Gerät (NTSTATUS; 0 = angenommen).
     private(set) var deviceReplies: [UInt32: UInt32] = [:]
-    /// Laufwerke mit Ordner; Datei-IRPs laufen nacheinander auf `driveQueue`, nicht auf dem Netzwerk-Thread.
+    /// Laufwerke mit Ordner; Datei-IRPs laufen nacheinander auf der Warteschlange des Geräts, nicht auf dem Netzwerk-Thread.
     private let devices: [UInt32: RDPDriveDevice]
-    private let driveQueue = DispatchQueue(label: "rdpkit.rdpdr.drive")
     private var reassembler = RDPStaticVirtualChannelReassembler()
 
     init(
@@ -550,6 +549,9 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
             }
         }
         self.devices = devices
+        for device in devices.values {
+            device.sendLater = { [weak self] reply in self?.send(reply) }
+        }
     }
 
     /// Setzt geteilte Kanal-Nachrichten zusammen (Schreib-Anforderungen sind größer als ein Kanal-Teil).
@@ -631,7 +633,7 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
                 send(request.notSupportedCompletion())
                 return
             }
-            driveQueue.async { [self] in
+            device.queue.async { [self] in
                 if let reply = device.handle(request) { send(reply) }
             }
 
