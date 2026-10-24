@@ -353,3 +353,34 @@ extension DriveFixture {
     let modified = try FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date
     #expect(modified == Date(timeIntervalSince1970: 1_577_836_800))
 }
+
+@Test func driveLinksDoNotLeaveTheSharedFolder() throws {
+    var fixture = try DriveFixture()
+    defer { fixture.cleanUp() }
+    let outside = FileManager.default.temporaryDirectory.appending(path: "rdpkit-outside-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: outside) }
+    try Data("geheim".utf8).write(to: outside.appending(path: "secret.txt"))
+    let manager = FileManager.default
+    try manager.createSymbolicLink(at: fixture.root.appending(path: "raus"), withDestinationURL: outside)
+    try manager.createSymbolicLink(at: fixture.root.appending(path: "datei-raus.txt"),
+                                   withDestinationURL: outside.appending(path: "secret.txt"))
+    try manager.createSymbolicLink(at: fixture.root.appending(path: "haengt.txt"),
+                                   withDestinationURL: outside.appending(path: "neu.txt"))
+    try manager.createDirectory(at: fixture.root.appending(path: "innen"), withIntermediateDirectories: true)
+    try Data("ok".utf8).write(to: fixture.root.appending(path: "innen/a.txt"))
+    try manager.createSymbolicLink(at: fixture.root.appending(path: "drinnen"),
+                                   withDestinationURL: fixture.root.appending(path: "innen"))
+
+    #expect(fixture.create("\\raus\\secret.txt").status == RDPNTStatus.accessDenied)
+    #expect(fixture.create("\\raus\\neu.txt", disposition: 3).status == RDPNTStatus.accessDenied)   // openIf
+    #expect(fixture.create("\\datei-raus.txt").status == RDPNTStatus.accessDenied)
+    #expect(fixture.create("\\haengt.txt", disposition: 3).status == RDPNTStatus.accessDenied)
+    #expect(!manager.fileExists(atPath: outside.appending(path: "neu.txt").path))
+    // Links innerhalb des Ordners und neue Dateien bleiben möglich
+    let inside = fixture.create("\\drinnen\\a.txt")
+    #expect(inside.status == 0)
+    #expect(fixture.read(inside.fileID, length: 2).output.dropFirst(4) == Data("ok".utf8))
+    #expect(fixture.create("\\innen\\neu\\x.txt", disposition: 3).status == RDPNTStatus.objectPathNotFound)
+    #expect(fixture.create("\\neu.txt", disposition: 2).status == 0)
+}

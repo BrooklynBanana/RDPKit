@@ -204,13 +204,36 @@ final class RDPDriveDevice: @unchecked Sendable {
     // MARK: Pfade
 
     /// `\Ordner\Datei` relativ zum freigegebenen Ordner; `..` wird abgelehnt (nicht aus dem Ordner heraus).
+    /// Links im Mac-Ordner dürfen ebenfalls nicht hinausführen: Geprüft wird auch der Pfad mit aufgelösten Links
+    /// (Windows kann selbst keine anlegen, im gewählten Ordner können aber welche liegen).
     func resolve(_ windowsPath: String) -> URL? {
         let parts = windowsPath.split(whereSeparator: { $0 == "\\" || $0 == "/" }).map(String.init)
         guard !parts.contains(where: { $0 == ".." || $0 == "." }) else { return nil }
         let url = parts.reduce(root) { $0.appending(path: $1) }
         let standardized = url.standardizedFileURL
         guard standardized.path == root.path || standardized.path.hasPrefix(root.path + "/") else { return nil }
+        guard let realRoot = Self.realPath(root), let real = Self.realPath(standardized),
+              real == realRoot || real.hasPrefix(realRoot == "/" ? "/" : realRoot + "/") else { return nil }
         return standardized
+    }
+
+    /// Pfad mit aufgelösten Links; noch nicht vorhandene Teile werden angehängt. `nil` bei einem Link ohne Ziel
+    /// (sein Ziel könnte außerhalb angelegt werden).
+    static func realPath(_ url: URL) -> String? {
+        var existing = url.path
+        var missing: [String] = []
+        while true {
+            if let resolved = realpath(existing, nil) {
+                defer { free(resolved) }
+                let base = String(cString: resolved)
+                guard !missing.isEmpty else { return base }
+                return (base == "/" ? "" : base) + "/" + missing.reversed().joined(separator: "/")
+            }
+            var info = stat()
+            guard errno == ENOENT, lstat(existing, &info) != 0, existing != "/" else { return nil }
+            missing.append((existing as NSString).lastPathComponent)
+            existing = (existing as NSString).deletingLastPathComponent
+        }
     }
 
     private static func readPath(_ body: inout ByteCursor, length: UInt32) throws -> String {
