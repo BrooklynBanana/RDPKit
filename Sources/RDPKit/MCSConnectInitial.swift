@@ -110,6 +110,7 @@ struct MCSConnectInitialConfiguration: Equatable, Sendable {
     var storedClientLicense: RDPStoredClientLicense?
     /// Laufwerksumleitung (Connection Manager) – für die rdpdr-Sitzung.
     var redirectedDrives: [RDPRedirectedDrive] = []
+    var keyboardLayout: UInt32 = 0x0409
 
     init(
         desktopWidth: UInt16 = 1280,
@@ -217,7 +218,7 @@ struct MCSConnectInitialPDU: Equatable, Sendable {
         body.appendLittleEndianUInt16(configuration.desktopHeight)
         body.appendLittleEndianUInt16(0xCA01)
         body.appendLittleEndianUInt16(0xAA03)
-        body.appendLittleEndianUInt32(0x0000_0409)
+        body.appendLittleEndianUInt32(configuration.keyboardLayout)
         body.appendLittleEndianUInt32(3790)
         body.append(fixedUTF16LE(configuration.clientName, codeUnitCount: 16))
         body.appendLittleEndianUInt32(4)

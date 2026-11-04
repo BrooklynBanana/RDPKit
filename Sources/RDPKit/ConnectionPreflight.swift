@@ -141,6 +141,9 @@ public struct RDPConnectionConfiguration: Sendable, Equatable {
     public var redirectedDrives: [RDPRedirectedDrive] = []
     /// Name dieses Rechners für den Server (höchstens 15 Zeichen; Windows zeigt z. B. „Mac auf <Name>“).
     public var clientName = "KRDPSWIFT"
+    /// Tastaturlayout des Clients als Windows-KLID (TS_UD_CS_CORE keyboardLayout, z. B. 0x0407 Deutsch);
+    /// bestimmt, wie der Server Scancodes übersetzt. Connection Manager.
+    public var keyboardLayout: UInt32 = 0x0409
 
     public init(
         host: String,
@@ -1184,6 +1187,7 @@ public struct RDPPreflightClient: Sendable {
                 )
                 mcsConfiguration.redirectedDrives = configuration.redirectedDrives
                 mcsConfiguration.clientName = configuration.clientName
+                mcsConfiguration.keyboardLayout = configuration.keyboardLayout
                 let tls = try performTLSHandshake(
                     fd: connection.fd,
                     host: configuration.host,
