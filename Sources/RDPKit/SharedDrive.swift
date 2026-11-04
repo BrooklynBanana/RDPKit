@@ -1,3 +1,4 @@
+import CoreServices
 import Darwin
 import Foundation
 
@@ -59,6 +60,24 @@ final class RDPSharedDriveDevice: @unchecked Sendable {
     /// What the listings of `openFiles` hold, in `listingByteCount(of:)` bytes.
     private var listingByteCount = 0
 
+    /// A change notification the server left pending on a directory handle
+    /// ([MS-RDPEFS] 2.2.3.3.11); completed once something in that directory
+    /// (or below it, with WatchTree) changes, or when the handle closes.
+    private struct PendingNotification {
+        var completionID: UInt32
+        var directory: String
+        var watchTree: Bool
+    }
+
+    /// Sends a completion for a request that was left pending. Set by the device
+    /// redirection session; runs on `watchQueue`.
+    var sendLater: (@Sendable (RDPDeviceIOCompletion) -> Void)?
+    /// The queue every request is served on; file-system events are delivered to it
+    /// too, so the device's state stays confined to it. Set by the session.
+    var watchQueue: DispatchQueue?
+    private var pendingNotifications: [UInt32: [PendingNotification]] = [:]
+    private var eventStream: FSEventStreamRef?
+
     init(
         deviceID: UInt32,
         drive: RDPSharedDrive,
@@ -84,6 +103,8 @@ final class RDPSharedDriveDevice: @unchecked Sendable {
             release(file)
         }
         openFiles = [:]
+        pendingNotifications = [:]
+        stopWatching()
     }
 
     /// Resolves the shared folder, so a drive is announced only while it exists.
@@ -102,7 +123,11 @@ final class RDPSharedDriveDevice: @unchecked Sendable {
     func completion(for request: RDPDeviceIORequest) -> RDPDeviceIOCompletion? {
         let body: Data
         do {
-            guard let reply = try reply(to: RDPDriveRequest.parse(request), fileID: request.fileID) else {
+            let parsed = try RDPDriveRequest.parse(request)
+            if case let .notifyChangeDirectory(watchTree) = parsed {
+                return notifyChangeDirectory(request, watchTree: watchTree)
+            }
+            guard let reply = try reply(to: parsed, fileID: request.fileID) else {
                 return nil
             }
             body = reply
@@ -319,7 +344,116 @@ final class RDPSharedDriveDevice: @unchecked Sendable {
         guard let file = openFiles.removeValue(forKey: fileID) else {
             throw RDPDriveFailure.invalidHandle
         }
+        // A closing handle completes its pending change notifications ([MS-FSCC] 2.3.1 semantics).
+        for notification in pendingNotifications.removeValue(forKey: fileID) ?? [] {
+            sendLater?(notificationCompletion(notification, status: RDPNTStatus.notifyCleanup))
+        }
         release(file)
+    }
+
+    // MARK: Change notification
+
+    /// Leaves the request pending; once something in the directory changes (or below it,
+    /// with WatchTree), it completes with STATUS_NOTIFY_ENUM_DIR and no entries, so the
+    /// server re-enumerates the directory — Explorer then refreshes its view by itself.
+    /// The whole shared folder is watched with one FSEvents stream.
+    private func notifyChangeDirectory(_ request: RDPDeviceIORequest, watchTree: Bool) -> RDPDeviceIOCompletion? {
+        guard let file = openFiles[request.fileID], file.isDirectory, sendLater != nil else {
+            return RDPDeviceIOCompletion(
+                deviceID: deviceID,
+                completionID: request.completionID,
+                status: RDPNTStatus.notSupported,
+                body: request.failureReplyBody
+            )
+        }
+        startWatching()
+        guard eventStream != nil else {
+            return RDPDeviceIOCompletion(
+                deviceID: deviceID,
+                completionID: request.completionID,
+                status: RDPNTStatus.notSupported,
+                body: request.failureReplyBody
+            )
+        }
+        pendingNotifications[request.fileID, default: []].append(PendingNotification(
+            completionID: request.completionID,
+            directory: file.targetPath,
+            watchTree: watchTree
+        ))
+        return nil
+    }
+
+    /// Paths FSEvents reported as changed, delivered on `watchQueue`.
+    func filesChanged(_ paths: [String]) {
+        for (fileID, notifications) in pendingNotifications {
+            var remaining: [PendingNotification] = []
+            for notification in notifications {
+                let hit = paths.contains { path in
+                    path == notification.directory
+                        || (path as NSString).deletingLastPathComponent == notification.directory
+                        || (notification.watchTree && path.hasPrefix(notification.directory + "/"))
+                }
+                if hit {
+                    sendLater?(notificationCompletion(notification, status: RDPNTStatus.notifyEnumDir))
+                } else {
+                    remaining.append(notification)
+                }
+            }
+            pendingNotifications[fileID] = remaining.isEmpty ? nil : remaining
+        }
+    }
+
+    /// DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP with no entries: Length 0, Padding
+    /// ([MS-RDPEFS] 2.2.3.4.11).
+    private func notificationCompletion(
+        _ notification: PendingNotification,
+        status: UInt32
+    ) -> RDPDeviceIOCompletion {
+        RDPDeviceIOCompletion(
+            deviceID: deviceID,
+            completionID: notification.completionID,
+            status: status,
+            body: Data(count: 5)
+        )
+    }
+
+    private final class WeakDevice {
+        weak var device: RDPSharedDriveDevice?
+        init(_ device: RDPSharedDriveDevice) { self.device = device }
+    }
+
+    private func startWatching() {
+        guard eventStream == nil, let watchQueue, let rootPath else { return }
+        let box = Unmanaged.passRetained(WeakDevice(self)).toOpaque()
+        var context = FSEventStreamContext(version: 0, info: box, retain: nil, release: { info in
+            if let info { Unmanaged<WeakDevice>.fromOpaque(info).release() }
+        }, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, paths, _, _ in
+            guard let info else { return }
+            let changed = unsafeBitCast(paths, to: NSArray.self).compactMap { $0 as? String }
+            Unmanaged<WeakDevice>.fromOpaque(info).takeUnretainedValue().device?.filesChanged(changed)
+        }
+        let flags = kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagFileEvents
+            | kFSEventStreamCreateFlagNoDefer
+        guard let stream = FSEventStreamCreate(
+            nil, callback, &context, [rootPath] as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.1, FSEventStreamCreateFlags(flags)
+        ) else { return }
+        FSEventStreamSetDispatchQueue(stream, watchQueue)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            return
+        }
+        eventStream = stream
+    }
+
+    private func stopWatching() {
+        guard let stream = eventStream else { return }
+        eventStream = nil
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
     }
 
     /// Closes a handle's descriptor and deletes its entry if a delete is pending.
@@ -444,9 +578,25 @@ final class RDPSharedDriveDevice: @unchecked Sendable {
             let creationTime = try cursor.readLittleEndianUInt64()
             _ = try cursor.readLittleEndianUInt64() // LastAccessTime
             let lastWriteTime = try cursor.readLittleEndianUInt64()
-            // ChangeTime and FileAttributes are not applied: the change time is the
-            // system's, and the attributes have no exact match in POSIX permissions.
+            _ = try? cursor.readLittleEndianUInt64() // ChangeTime: the system's, not applied.
+            let attributes = (try? cursor.readLittleEndianUInt32()) ?? 0
             _ = try verifiedTarget(of: file)
+            // FILE_ATTRIBUTE_READONLY maps to the POSIX write bits for files; 0 leaves the
+            // attributes unchanged ([MS-FSCC] 2.4.7). The other attributes (hidden,
+            // archive, …) have no match in POSIX permissions and are not applied.
+            if attributes != 0, !file.isDirectory {
+                var info = stat()
+                guard stat(file.targetPath, &info) == 0 else {
+                    throw RDPDriveFailure.posix()
+                }
+                let mode = info.st_mode & 0o7777
+                let wanted = attributes & RDPDriveFileAttributes.readOnly != 0
+                    ? mode & ~mode_t(0o222)
+                    : mode | (mode & 0o222 == 0 ? mode_t(0o200) : 0)
+                if wanted != mode, chmod(file.targetPath, wanted) != 0 {
+                    throw RDPDriveFailure.posix()
+                }
+            }
             try setTimes(of: file.targetPath, creationTime: creationTime, lastWriteTime: lastWriteTime)
         case RDPDriveInformationClass.fileEndOfFile:
             try truncate(fileID, to: cursor.readLittleEndianUInt64(), onlyShrinking: false)

@@ -354,6 +354,15 @@ final class RDPDeviceRedirectionSession: @unchecked Sendable {
         self.drives = drives.enumerated().map { RDPSharedDriveDevice(deviceID: UInt32($0.offset + 1), drive: $0.element) }
         self.pendingEventHandler = pendingEventHandler
         self.isCancelled = isCancelled
+        // Change notifications complete later, from file-system events delivered to the
+        // I/O queue, where every drive request is served too.
+        for drive in self.drives {
+            drive.watchQueue = ioQueue
+            drive.sendLater = { [weak self] completion in
+                guard let self, !self.isCancelled() else { return }
+                self.replyBudget.write(self.packets(completion.encoded()), to: self.channel)
+            }
+        }
     }
 
     @discardableResult

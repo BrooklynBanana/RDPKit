@@ -568,19 +568,24 @@ import Testing
 
 @Test func driveLeavesChangeNotificationsPendingAndAnswersOtherRequests() throws {
     let drive = try TemporaryDrive()
-    let root = drive.create("", disposition: RDPDriveCreateDisposition.open)
+    // With a way to complete them later, notifications stay pending (and the ones
+    // without one are declined: driveDeclinesChangeNotificationsWithoutAsyncReplies).
+    let queue = DispatchQueue(label: "rdpkit-test-drive-pending")
+    drive.device.watchQueue = queue
+    drive.device.sendLater = { _ in }
+    let root = queue.sync { drive.create("", disposition: RDPDriveCreateDisposition.open) }
 
-    #expect(drive.device.completion(for: driveRequest(
+    #expect(queue.sync { drive.device.completion(for: driveRequest(
         fileID: root.fileID,
         major: RDPDriveMajorFunction.directoryControl,
         minor: RDPDriveMinorFunction.notifyChangeDirectory,
         body: Data(count: 32)
-    )) == nil)
-    let control = try #require(drive.device.completion(for: driveRequest(
+    )) } == nil)
+    let control = try #require(queue.sync { drive.device.completion(for: driveRequest(
         fileID: root.fileID,
         major: RDPDriveMajorFunction.deviceControl,
         body: Data(count: 32)
-    )))
+    )) })
     #expect(control.status == RDPNTStatus.success)
     #expect(control.body == Data(count: 4))
     let volume = try #require(drive.device.completion(for: driveRequest(
@@ -1162,4 +1167,112 @@ private func lengthPrefixed(_ data: Data) -> Data {
     body.appendLittleEndianUInt32(UInt32(data.count))
     body.append(data)
     return body
+}
+
+// MARK: Change notification and the read-only attribute
+
+@Test func driveCompletesChangeNotificationsOnChangesAndClose() throws {
+    let drive = try TemporaryDrive()
+    try FileManager.default.createDirectory(
+        at: drive.root.appendingPathComponent("sub/deep"),
+        withIntermediateDirectories: true
+    )
+    Thread.sleep(forTimeInterval: 1) // FSEvents would still report the setup above.
+    let queue = DispatchQueue(label: "rdpkit-test-drive-watch")
+    drive.device.watchQueue = queue
+    let later = LaterCompletions()
+    drive.device.sendLater = { later.append($0) }
+
+    let root = queue.sync { drive.create("", disposition: RDPDriveCreateDisposition.open, options: 0x1) }
+    let sub = queue.sync { drive.create("\\sub", disposition: RDPDriveCreateDisposition.open, options: 0x1) }
+    #expect(queue.sync { drive.device.completion(for: notifyRequest(fileID: root.fileID, completionID: 11)) } == nil)
+    #expect(queue.sync {
+        drive.device.completion(for: notifyRequest(fileID: sub.fileID, completionID: 12, watchTree: true))
+    } == nil)
+    Thread.sleep(forTimeInterval: 0.3) // The stream starts up.
+
+    // With WatchTree, a change anywhere below the directory completes the notification.
+    try Data("x".utf8).write(to: drive.root.appendingPathComponent("sub/deep/new.txt"))
+    #expect(later.wait(for: 12) == RDPNTStatus.notifyEnumDir)
+    #expect(later.wait(for: 11, seconds: 0.5) == nil) // Not a change in the root itself.
+    try Data("y".utf8).write(to: drive.root.appendingPathComponent("top.txt"))
+    #expect(later.wait(for: 11) == RDPNTStatus.notifyEnumDir)
+
+    // Closing the handle completes its pending notification.
+    #expect(queue.sync { drive.device.completion(for: notifyRequest(fileID: root.fileID, completionID: 13)) } == nil)
+    #expect(queue.sync { drive.close(root.fileID) }.status == RDPNTStatus.success)
+    #expect(later.wait(for: 13) == RDPNTStatus.notifyCleanup)
+    _ = queue.sync { drive.close(sub.fileID) }
+}
+
+@Test func driveDeclinesChangeNotificationsWithoutAsyncReplies() throws {
+    let drive = try TemporaryDrive()
+    let root = drive.create("", disposition: RDPDriveCreateDisposition.open, options: 0x1)
+    let completion = drive.device.completion(for: notifyRequest(fileID: root.fileID, completionID: 9))
+    #expect(completion?.status == RDPNTStatus.notSupported)
+    #expect(completion?.body == Data(count: 5))
+}
+
+@Test func driveSetsAndClearsTheReadOnlyAttribute() throws {
+    let drive = try TemporaryDrive()
+    let url = drive.root.appendingPathComponent("guarded.txt")
+    try Data().write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: url.path)
+    func basic(_ attributes: UInt32) -> Data {
+        var buffer = Data(count: 32) // Four FILETIMEs of 0: the times stay unchanged.
+        buffer.appendLittleEndianUInt32(attributes)
+        return buffer
+    }
+    func mode() throws -> Int {
+        try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as! Int
+    }
+    let file = drive.create("\\guarded.txt", disposition: RDPDriveCreateDisposition.open, access: 0x0000_0100)
+    let readOnlyArchive: UInt32 = RDPDriveFileAttributes.readOnly | RDPDriveFileAttributes.archive
+    #expect(drive.setInformation(file.fileID, informationClass: RDPDriveInformationClass.fileBasic,
+                                 basic(readOnlyArchive)).status == RDPNTStatus.success)
+    #expect(try mode() == 0o444)
+    // 0 leaves the attributes unchanged ([MS-FSCC] 2.4.7).
+    #expect(drive.setInformation(file.fileID, informationClass: RDPDriveInformationClass.fileBasic,
+                                 basic(0)).status == RDPNTStatus.success)
+    #expect(try mode() == 0o444)
+    // FILE_ATTRIBUTE_NORMAL clears the read-only attribute: the owner can write again.
+    #expect(drive.setInformation(file.fileID, informationClass: RDPDriveInformationClass.fileBasic,
+                                 basic(0x80)).status == RDPNTStatus.success)
+    #expect(try mode() == 0o644)
+    _ = drive.close(file.fileID)
+}
+
+private func notifyRequest(fileID: UInt32, completionID: UInt32, watchTree: Bool = false) -> RDPDeviceIORequest {
+    var body = Data([watchTree ? 1 : 0])
+    body.appendLittleEndianUInt32(0x17) // CompletionFilter, not applied.
+    body.append(Data(count: 27))
+    return RDPDeviceIORequest(
+        deviceID: 1,
+        fileID: fileID,
+        completionID: completionID,
+        majorFunction: RDPDriveMajorFunction.directoryControl,
+        minorFunction: RDPDriveMinorFunction.notifyChangeDirectory,
+        body: body
+    )
+}
+
+private final class LaterCompletions: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completions: [(completionID: UInt32, status: UInt32)] = []
+
+    func append(_ completion: RDPDeviceIOCompletion) {
+        lock.withLock { completions.append((completion.completionID, completion.status)) }
+    }
+
+    /// Waits up to `seconds` for the completion of `completionID`.
+    func wait(for completionID: UInt32, seconds: Double = 5) -> UInt32? {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if let found = lock.withLock({ completions.first { $0.completionID == completionID } }) {
+                return found.status
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return nil
+    }
 }

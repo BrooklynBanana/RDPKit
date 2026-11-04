@@ -44,6 +44,11 @@ enum RDPDriveMinorFunction {
 /// The NTSTATUS values a drive answers with ([MS-ERREF] 2.3.1).
 enum RDPNTStatus {
     static let success: UInt32 = 0x0000_0000
+    /// Completes a pending change notification when its handle closes ([MS-ERREF] 2.3.1).
+    static let notifyCleanup: UInt32 = 0x0000_010B
+    /// Completes a pending change notification with no entries, so the server
+    /// re-enumerates the directory ([MS-ERREF] 2.3.1).
+    static let notifyEnumDir: UInt32 = 0x0000_010C
     static let noMoreFiles: UInt32 = 0x8000_0006
     static let unsuccessful: UInt32 = 0xC000_0001
     static let invalidParameter: UInt32 = 0xC000_000D
@@ -191,7 +196,7 @@ enum RDPDriveRequest: Equatable, Sendable {
     case queryVolumeInformation(informationClass: UInt32)
     case setVolumeInformation(length: UInt32)
     case queryDirectory(informationClass: UInt32, initialQuery: Bool, path: String)
-    case notifyChangeDirectory
+    case notifyChangeDirectory(watchTree: Bool)
     case deviceControl
     case lockControl
     case unsupported
@@ -243,7 +248,9 @@ enum RDPDriveRequest: Equatable, Sendable {
                 let path = try decodePath(cursor.readData(count: pathLength))
                 return .queryDirectory(informationClass: informationClass, initialQuery: initialQuery, path: path)
             case RDPDriveMinorFunction.notifyChangeDirectory:
-                return .notifyChangeDirectory
+                // DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ: WatchTree, then CompletionFilter
+                // ([MS-RDPEFS] 2.2.3.3.11); the filter is not applied, as FreeRDP's drive ignores it.
+                return .notifyChangeDirectory(watchTree: (try? cursor.readUInt8()).map { $0 != 0 } ?? false)
             default:
                 return .unsupported
             }
