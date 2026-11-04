@@ -939,6 +939,19 @@ extension RDPClipboardFileContentsResponse {
     }
 }
 
+/// How far the server's paste of one published file has come: the range of the file served
+/// so far (the server reads each file front to back) and the file's place in the copy.
+public struct RDPClipboardLocalFilePasteProgress: Equatable, Sendable {
+    /// The published name, as the copy offers it (a path for a file inside a folder).
+    public var fileName: String
+    /// 0-based, within the published copy.
+    public var fileIndex: Int
+    public var fileCount: Int
+    /// The end of the range served so far, in bytes.
+    public var servedByteCount: UInt64
+    public var fileByteCount: UInt64
+}
+
 public final class RDPClipboardSession: @unchecked Sendable {
     public let staticChannelID: UInt16
     /// The connection this session belongs to.
@@ -1064,6 +1077,15 @@ public final class RDPClipboardSession: @unchecked Sendable {
             setFetching(newValue)
         }
     }
+
+    /// Reports, on the connection thread, each range of a published file served to the
+    /// server — the progress of a paste on the server side. Nil turns the reports off.
+    public var onLocalFilePasteProgress: (@Sendable (RDPClipboardLocalFilePasteProgress) -> Void)? {
+        get { lock.withLock { localFilePasteProgressHandler } }
+        set { lock.withLock { localFilePasteProgressHandler = newValue } }
+    }
+
+    private var localFilePasteProgressHandler: (@Sendable (RDPClipboardLocalFilePasteProgress) -> Void)?
 
     /// Turns ``fetchesRemoteCopies`` on, and returns whether a copy the server announced is
     /// being fetched then, such as one announced while fetching was off, which publishing now
@@ -1727,6 +1749,13 @@ public final class RDPClipboardSession: @unchecked Sendable {
             streamID: request.streamID,
             data: file.contents.subdata(in: lowerBound ..< lowerBound + byteCount)
         ).encoded(), waitingForRoom: true)
+        onLocalFilePasteProgress?(RDPClipboardLocalFilePasteProgress(
+            fileName: file.descriptor.fileName,
+            fileIndex: Int(request.fileIndex),
+            fileCount: files.count,
+            servedByteCount: request.position + UInt64(byteCount),
+            fileByteCount: file.descriptor.fileSize
+        ))
     }
 
     /// The Format List makes this client the Shared Clipboard Owner (MS-RDPECLIP 1.3.2.2.1), so

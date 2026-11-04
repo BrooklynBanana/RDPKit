@@ -938,6 +938,37 @@ private final class ClipboardPublishRace: @unchecked Sendable {
     }
 }
 
+@Test func clipboardReportsPasteProgressOfPublishedFiles() throws {
+    let channel = EmbeddedChannel()
+    let session = RDPClipboardSession(
+        userChannelID: 1006,
+        staticChannelID: 1007,
+        channel: channel,
+        sentMessageHandler: { _, _ in }
+    )
+    let reports = Locked([RDPClipboardLocalFilePasteProgress]())
+    session.onLocalFilePasteProgress = { progress in reports.withLock { $0.append(progress) } }
+    session.publishLocalFiles([RDPClipboardLocalFile(fileName: "big.bin", contents: Data(count: 10))])
+    _ = try session.receive(RDPClipboardPDU(messageType: RDPClipboardMessageType.monitorReady))
+
+    func receive(_ request: RDPClipboardFileContentsRequestPDU) throws {
+        _ = try session.receive(RDPClipboardPDU.parse(from: request.encoded()))
+    }
+    // A size request reports nothing; each served range reports how far the file has come.
+    try receive(.size(streamID: 1, fileIndex: 0))
+    #expect(reports.value.isEmpty)
+    try receive(.range(streamID: 2, fileIndex: 0, position: 0, requestedByteCount: 6))
+    try receive(.range(streamID: 3, fileIndex: 0, position: 6, requestedByteCount: 6))
+    #expect(reports.value == [
+        RDPClipboardLocalFilePasteProgress(
+            fileName: "big.bin", fileIndex: 0, fileCount: 1, servedByteCount: 6, fileByteCount: 10
+        ),
+        RDPClipboardLocalFilePasteProgress(
+            fileName: "big.bin", fileIndex: 0, fileCount: 1, servedByteCount: 10, fileByteCount: 10
+        ),
+    ])
+}
+
 @Test func clipboardSessionSkipsCapabilitiesWhenServerSentNoneAndUsesShortNames() throws {
     let channel = EmbeddedChannel()
     let sent = ClipboardSentMessages()
